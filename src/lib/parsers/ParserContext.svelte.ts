@@ -1,4 +1,4 @@
-import { SvelteMap } from 'svelte/reactivity';
+import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 const SOURCE_MAP: Record<number, string> = {
     1: "Player's Handbook 2014", 2: "Player's Handbook 2014", 3: "Basic Rules",
@@ -19,7 +19,8 @@ const SOURCE_MAP: Record<number, string> = {
     150: "Grim Hollow: Player Pack", 151: "Book of Ebon Tides",
     152: "Tales from the Shadows", 154: "Dr Dhrolin's Dictionary of Dinosaurs",
     160: "Obojima: Tales from the Tall Grass", 162: "Heliana's Guide to Monster Hunting: Part 1",
-    164: "Valda's Spire of Secrets: Player Pack", 193: "The Crooked Moon Part One: Player Options & Campaign Setting",
+    164: "Valda's Spire of Secrets: Player Pack",
+    193: "The Crooked Moon Part One: Player Options & Campaign Setting",
     196: "Monsters of Drakkenheim", 197: "The Gunslinger Class: Valda's Spire of Secrets",
     200: "Cthulhu by Torchlight", 202: "Abomination Vaults",
     205: "Forgotten Realms: Heroes of Faerûn", 207: "Grim Hollow: Player's Guide",
@@ -29,21 +30,39 @@ const SOURCE_MAP: Record<number, string> = {
 };
 
 export class ParserContext {
+    /** Maps class ID → class name, populated when Classes are processed. */
     classMap = new SvelteMap<number, string>();
-    
+
+    /** Tracks class feature IDs, used by SubclassParser to filter base class features. */
+    classFeatureIds = new SvelteSet<number>();
+
     registerClass(id: number, name: string) {
         this.classMap.set(id, name);
     }
 
+    registerClassFeatureId(id: number) {
+        this.classFeatureIds.add(id);
+    }
+
+    /** Throws a descriptive error if classes haven't been processed yet. */
     getClassName(id: number): string {
         const name = this.classMap.get(id);
-        if (!name) throw new Error(`Missing parent class reference for ID: ${id}. Process Classes first.`);
+        if (!name) throw new Error(`Missing parent class for ID ${id}. Process the Classes payload first.`);
         return name;
+    }
+
+    hasClassFeatureIds(): boolean {
+        return this.classFeatureIds.size > 0;
+    }
+
+    isBaseClassFeature(id: number | undefined): boolean {
+        if (id === undefined) return false;
+        return this.classFeatureIds.has(id);
     }
 
     getSourceName(id: number | null | undefined): string {
         if (!id) return '';
-        return SOURCE_MAP[id] || `Source ${id}`;
+        return SOURCE_MAP[id] ?? `Source ${id}`;
     }
 }
 

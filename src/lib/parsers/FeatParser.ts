@@ -8,39 +8,42 @@ export class FeatParser {
 
     execute(rawData: unknown) {
         const parsedData = z.array(DdbFeatSchema).parse(rawData);
+
+        // Deduplicate: keep one entry per feat name, preferring the newest source (highest sourceId).
+        // The payload contains multiple entries — PHB 2014 + PHB 2024 versions, plus
+        // repeatable-feat instances that each get their own entry.
+        const deduped = ExtractionService.dedupByName(parsedData);
+
         const rows: Record<string, unknown>[] = [];
 
-        for (let i = 0; i < parsedData.length; i++) {
-            const feat = parsedData[i];
+        for (let i = 0; i < deduped.length; i++) {
+            const feat = deduped[i];
             const desc = ExtractionService.cleanText(feat.description);
+            const snippet = ExtractionService.cleanText(feat.snippet);
             const categories = feat.categories.map(c => c.tagName).join(',');
-            
-            let asiAmount = '', asiFixed = '', asiChoices = '';
-            const asiMatch = desc.match(/Increase your ([A-Za-z ]+?)\s+(?:score\s+)?by\s+(\d+)/i);
-            if (asiMatch) {
-                asiAmount = asiMatch[2];
-                const statStr = asiMatch[1].trim();
-                if (/ability score/i.test(statStr)) asiChoices = 'Strength,Dexterity,Constitution,Intelligence,Wisdom,Charisma';
-                else if (/\s+or\s+/i.test(statStr)) asiChoices = statStr.split(/\s+or\s+/i).map(s => s.trim()).join(',');
-                else asiFixed = statStr;
-            }
+            const isEpicBoon = (categories.toLowerCase().includes('epic boon') ||
+                feat.name.toLowerCase().startsWith('epic boon')) ? 'true' : 'false';
+
+            const asi = ExtractionService.extractASI(desc);
+            const prereqs = ExtractionService.buildPrerequisites(feat.prerequisites);
 
             rows.push({
                 name: feat.name,
                 description: desc,
-                snippet: ExtractionService.cleanText(feat.snippet),
+                snippet,
                 repeatable: feat.isRepeatable ? 'true' : 'false',
-                categories: categories,
-                prerequisites: '',
+                categories,
+                prerequisites: prereqs,
                 detailsUrl: feat.moreDetailsUrl ? `https://www.dndbeyond.com${feat.moreDetailsUrl}` : '',
-                isEpicBoon: (categories.toLowerCase().includes('epic boon') || feat.name.toLowerCase().startsWith('epic boon')) ? 'true' : 'false',
-                asiAmount: asiAmount,
-                asiStatFixed: asiFixed,
-                asiStatChoices: asiChoices,
-                ...ExtractionService.getEmptyGrants(),
+                isEpicBoon,
+                asiAmount: asi.amount,
+                asiStatFixed: asi.fixed,
+                asiStatChoices: asi.choices,
+                ...ExtractionService.buildGrantRow(desc),
                 sortOrder: i + 1
             });
         }
+
         return { feats: { rows, sheet: 'feats', file: 'feats.xlsx' } };
     }
 }

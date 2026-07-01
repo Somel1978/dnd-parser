@@ -12,19 +12,29 @@ export class BackgroundParser {
 
         for (let i = 0; i < parsedData.length; i++) {
             const bg = parsedData[i];
-            const featId = bg.grantedFeats?.[0]?.featIds?.[0] || '';
+
+            // Use dedicated proficiency description fields where available,
+            // falling back to the full description for unlabeled patterns
+            const skillTxt = ExtractionService.cleanText(bg.skillProficienciesDescription) || ExtractionService.cleanText(bg.description);
+            const toolTxt  = ExtractionService.cleanText(bg.toolProficienciesDescription)  || ExtractionService.cleanText(bg.description);
+            const langTxt  = ExtractionService.cleanText(bg.languagesDescription)          || ExtractionService.cleanText(bg.description);
+            const fullTxt  = ExtractionService.cleanText(bg.description);
+
+            // shortDescription: prefer cardDescription (concise), then shortDescription
+            const short = ExtractionService.cleanText(bg.cardDescription ?? bg.shortDescription ?? '');
 
             rows.push({
                 name: bg.name,
-                shortDescription: ExtractionService.cleanText(bg.shortDescription),
-                featureName: '',
+                shortDescription: short.length > 300 ? short.slice(0, 300) + '…' : short,
+                featureName: bg.featureName ?? '',
                 grantsFeatCategory: '',
-                grantsFeatId: featId,
-                ...ExtractionService.getEmptyGrants(),
+                grantsFeatId: '',
+                ...ExtractionService.buildBackgroundGrantRow(skillTxt, toolTxt, langTxt, fullTxt),
                 url: bg.moreDetailsUrl ? `https://www.dndbeyond.com${bg.moreDetailsUrl}` : '',
                 sortOrder: i + 1
             });
         }
+
         return { backgrounds: { rows, sheet: 'backgrounds', file: 'backgrounds.xlsx' } };
     }
 }
