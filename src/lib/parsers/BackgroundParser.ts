@@ -8,29 +8,30 @@ export class BackgroundParser {
 
     execute(rawData: unknown) {
         const parsedData = z.array(DdbBackgroundSchema).parse(rawData);
+        const deduped    = ExtractionService.markLegacyDuplicates(parsedData);
+
         const rows: Record<string, unknown>[] = [];
 
-        for (let i = 0; i < parsedData.length; i++) {
-            const bg = parsedData[i];
+        for (let i = 0; i < deduped.length; i++) {
+            const bg       = deduped[i];
+            const sourceId = bg.sources?.[0]?.sourceId ?? 0;
+            const uploadId = `${sourceId}:${bg.name}`;
 
-            // Use dedicated proficiency description fields where available,
-            // falling back to the full description for unlabeled patterns
             const skillTxt = ExtractionService.cleanText(bg.skillProficienciesDescription) || ExtractionService.cleanText(bg.description);
             const toolTxt  = ExtractionService.cleanText(bg.toolProficienciesDescription)  || ExtractionService.cleanText(bg.description);
             const langTxt  = ExtractionService.cleanText(bg.languagesDescription)          || ExtractionService.cleanText(bg.description);
             const fullTxt  = ExtractionService.cleanText(bg.description);
-
-            // shortDescription: prefer cardDescription (concise), then shortDescription
-            const short = ExtractionService.cleanText(bg.cardDescription ?? bg.shortDescription ?? '');
+            const short    = ExtractionService.cleanText(bg.cardDescription ?? bg.shortDescription ?? '');
 
             rows.push({
-                name: bg.name,
+                uploadId,
+                name:             bg.name,
                 shortDescription: short.length > 300 ? short.slice(0, 300) + '…' : short,
-                featureName: bg.featureName ?? '',
+                featureName:      bg.featureName ?? '',
                 grantsFeatCategory: '',
-                grantsFeatId: '',
+                grantsFeatId:     '',
                 ...ExtractionService.buildBackgroundGrantRow(skillTxt, toolTxt, langTxt, fullTxt),
-                url: bg.moreDetailsUrl ? `https://www.dndbeyond.com${bg.moreDetailsUrl}` : '',
+                url:       bg.moreDetailsUrl ? `https://www.dndbeyond.com${bg.moreDetailsUrl}` : '',
                 sortOrder: i + 1
             });
         }

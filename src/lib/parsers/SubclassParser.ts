@@ -3,57 +3,62 @@ import { DdbSubclassSchema } from '../schemas/ddb';
 import { ExtractionService } from './ExtractionService';
 import type { ParserContext } from './ParserContext.svelte';
 
+/** Strips DDB level prefixes like "8: Ability Score Increase" → "Ability Score Increase" */
+const stripLevelPrefix = (name: string) => name.replace(/^\d+:\s*/, '').trim();
+
 export class SubclassParser {
     constructor(private context: ParserContext) {}
 
     execute(rawData: unknown) {
         const parsedData = z.array(DdbSubclassSchema).parse(rawData);
+        const deduped    = ExtractionService.markLegacyDuplicates(parsedData);
+
         const subclassRows: Record<string, unknown>[] = [];
-        const featureRows: Record<string, unknown>[] = [];
+        const featureRows:  Record<string, unknown>[] = [];
         const hasBaseFeatureIds = this.context.hasClassFeatureIds();
 
-        for (let i = 0; i < parsedData.length; i++) {
-            const sub = parsedData[i];
-            const parentClassName = this.context.getClassName(sub.parentClassId);
-            const sourceName = this.context.getSourceName(sub.sources?.[0]?.sourceId);
+        for (let i = 0; i < deduped.length; i++) {
+            const sub           = deduped[i];
+            const sourceId      = sub.sources?.[0]?.sourceId ?? 0;
+            const parentName    = this.context.getClassName(sub.parentClassId);
+            const sourceName    = this.context.getSourceName(sourceId);
+            const uploadId      = `${sourceId}:${sub.name}`;
 
             subclassRows.push({
-                className: parentClassName,
-                name: sub.name,
-                description: ExtractionService.cleanText(sub.description),
-                source: sourceName,
-                link: sub.moreDetailsUrl ? `https://www.dndbeyond.com${sub.moreDetailsUrl}` : '',
+                uploadId,
+                className:    parentName,
+                name:         sub.name,
+                description:  ExtractionService.cleanText(sub.description),
+                source:       sourceName,
+                link:         sub.moreDetailsUrl ? `https://www.dndbeyond.com${sub.moreDetailsUrl}` : '',
                 canCastSpells: sub.spellCastingAbilityId != null ? 'true' : 'false',
-                sortOrder: i + 1
+                sortOrder:    i + 1
             });
 
-            // Filter out base class features if we have the cache from ClassParser
             const features = hasBaseFeatureIds
                 ? sub.classFeatures.filter(f => !this.context.isBaseClassFeature(f.id))
                 : sub.classFeatures;
 
             for (const feature of features) {
-                const featText = ExtractionService.cleanText(feature.description);
+                const featText  = ExtractionService.cleanText(feature.description);
+                const featSrcId = feature.definition?.sources?.[0]?.sourceId ?? sourceId;
+                const featName  = stripLevelPrefix(feature.name ?? '');
                 featureRows.push({
-                    className: parentClassName,
+                    uploadId:     `${featSrcId}:${sub.name}:${featName}:${feature.requiredLevel ?? 3}`,
+                    className:    parentName,
                     subclassName: sub.name,
-                    name: feature.name ?? '',
+                    name:         featName,
                     requiredLevel: feature.requiredLevel ?? 3,
-                    description: featText,
-                    url: feature.moreDetailsUrl ? `https://www.dndbeyond.com${feature.moreDetailsUrl}` : '',
+                    description:  featText,
+                    url:          feature.moreDetailsUrl ? `https://www.dndbeyond.com${feature.moreDetailsUrl}` : '',
                     ...ExtractionService.buildGrantRow(featText)
                 });
             }
         }
 
         return {
-            subclasses: { rows: subclassRows, sheet: 'subclasses', file: 'subclasses.xlsx' },
-            subclassFeatures: {
-                rows: featureRows,
-                sheet: 'subclassFeatures',
-                file: 'subclassFeatures.xlsx',
-                note: hasBaseFeatureIds ? undefined : 'Process Classes first to filter base class features'
-            }
+            subclasses:       { rows: subclassRows, sheet: 'subclasses',       file: 'subclasses.xlsx' },
+            subclassFeatures: { rows: featureRows,  sheet: 'subclassFeatures', file: 'subclassFeatures.xlsx' }
         };
     }
 }

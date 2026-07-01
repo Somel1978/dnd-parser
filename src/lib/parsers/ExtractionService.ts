@@ -608,18 +608,39 @@ export class ExtractionService {
         return [...abilityParts, ...parts].join(', ');
     }
 
-    // ── Feat deduplication ────────────────────────────────────────────────────
-    // Feats payload contains multiple entries per name (PHB 2014 + PHB 2024 versions,
-    // plus repeatable-feat instances). Keep one per name, preferring highest sourceId.
+    // ── Source deduplication ─────────────────────────────────────────────────
+    // Payloads contain multiple versions of the same entity (PHB 2014 + PHB 2024),
+    // plus repeatable-feat instances that produce identical entries with the same sourceId.
+    // Strategy:
+    //   1. Group by name (case-insensitive).
+    //   2. Within each group, deduplicate entries from the same sourceId (keeps first).
+    //   3. All versions are kept with their original name — uploadId (sourceId:name)
+    //      is the unique key used by the import server to distinguish them.
 
-    static dedupByName<T extends { name: string; sources?: { sourceId: number }[] }>(data: T[]): T[] {
-        const seen = new Map<string, { entry: T; srcId: number }>();
+    static markLegacyDuplicates<T extends { name: string; sources?: { sourceId: number }[] }>(data: T[]): T[] {
+        const groups = new Map<string, T[]>();
         for (const item of data) {
             const key = item.name.toLowerCase();
-            const srcId = item.sources?.[0]?.sourceId ?? 0;
-            const ex = seen.get(key);
-            if (!ex || srcId > ex.srcId) seen.set(key, { entry: item, srcId });
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key)!.push(item);
         }
-        return [...seen.values()].map(v => v.entry);
+
+        const result: T[] = [];
+        for (const [, group] of groups) {
+            if (group.length === 1) { result.push(group[0]); continue; }
+
+            // Deduplicate within the same sourceId (repeatable-feat instances etc.) — keep first
+            const bySource = new Map<number, T>();
+            for (const item of group) {
+                const srcId = item.sources?.[0]?.sourceId ?? 0;
+                if (!bySource.has(srcId)) bySource.set(srcId, item);
+            }
+
+            // All versions keep their original name — uploadId differentiates them
+            for (const [, item] of bySource) {
+                result.push(item);
+            }
+        }
+        return result;
     }
 }
