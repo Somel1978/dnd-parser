@@ -20,6 +20,10 @@ export default defineConfig({
 			adapter: adapter()
 		})
 	],
+	server: {
+		port: 4000, // Change this to your desired port
+		strictPort: true // Optional: fails if the port is already in use instead of incrementing
+	},
 	test: {
 		expect: { requireAssertions: true },
 		projects: [

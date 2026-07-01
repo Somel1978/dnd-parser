@@ -8,20 +8,28 @@ export class SpeciesParser {
 
     execute(rawData: unknown) {
         const parsedData = z.array(DdbSpeciesSchema).parse(rawData);
-        const speciesRows = [];
-        const traitRows = [];
+        const speciesRows: Record<string, unknown>[] = [];
+        const traitRows: Record<string, unknown>[] = [];
 
-        for (const sp of parsedData) {
+        for (let i = 0; i < parsedData.length; i++) {
+            const sp = parsedData[i];
+            const sourceName = this.context.getSourceName(sp.sources?.[0]?.sourceId);
+            
             speciesRows.push({
                 name: sp.fullName,
-                description: ExtractionService.stripHtml(sp.description)
+                description: ExtractionService.cleanText(sp.description),
+                source: sourceName,
+                link: sp.moreDetailsUrl ? `https://www.dndbeyond.com${sp.moreDetailsUrl}` : '',
+                isSubrace: sp.isSubRace ? 'true' : 'false',
+                isLegacy: sp.isLegacy ? 'true' : 'false',
+                sortOrder: i + 1
             });
 
             let explicitSpeedFound = false;
             let explicitSizeFound = false;
 
             for (const trait of sp.racialTraits) {
-                const desc = ExtractionService.stripHtml(trait.definition.description);
+                const desc = ExtractionService.cleanText(trait.definition?.description || trait.description);
                 const speeds = ExtractionService.extractSpeed(desc);
                 
                 if (speeds['WALK']) explicitSpeedFound = true;
@@ -29,10 +37,13 @@ export class SpeciesParser {
 
                 traitRows.push({
                     speciesName: sp.fullName,
-                    name: trait.definition.name,
+                    name: trait.definition?.name || trait.name || '',
                     description: desc,
-                    WALK: speeds['WALK'] || '',
-                    FLY: speeds['FLY'] || ''
+                    requiredLevel: trait.definition?.requiredLevel || trait.requiredLevel || 1,
+                    size: '', sizeChoices: '', senses: '',
+                    WALK: speeds['WALK'] || '', FLY: speeds['FLY'] || '',
+                    SWIM: speeds['SWIM'] || '', CLIMB: speeds['CLIMB'] || '', BURROW: speeds['BURROW'] || '',
+                    ...ExtractionService.getEmptyGrants()
                 });
             }
 
@@ -41,14 +52,18 @@ export class SpeciesParser {
                     speciesName: sp.fullName,
                     name: "Base Physiology",
                     description: "Inherent physical characteristics.",
+                    requiredLevel: 1,
                     size: explicitSizeFound ? '' : ExtractionService.mapSizeId(sp.sizeId),
-                    WALK: explicitSpeedFound ? '' : sp.weightSpeeds.normal.walk,
-                    FLY: sp.weightSpeeds.normal.fly,
-                    SWIM: sp.weightSpeeds.normal.swim
+                    sizeChoices: '', senses: '',
+                    WALK: explicitSpeedFound ? '' : (sp.weightSpeeds.normal.walk || ''),
+                    FLY: sp.weightSpeeds.normal.fly || '',
+                    SWIM: sp.weightSpeeds.normal.swim || '',
+                    CLIMB: sp.weightSpeeds.normal.climb || '',
+                    BURROW: sp.weightSpeeds.normal.burrow || '',
+                    ...ExtractionService.getEmptyGrants()
                 });
             }
         }
-
         return { 
             species: { rows: speciesRows, sheet: 'species', file: 'species.xlsx' },
             speciesTraits: { rows: traitRows, sheet: 'speciesTraits', file: 'speciesTraits.xlsx' }
