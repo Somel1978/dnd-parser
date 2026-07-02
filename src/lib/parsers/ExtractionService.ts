@@ -26,7 +26,7 @@ const DMG_TYPES = [
 ];
 const DMG_TYPES_LOWER = DMG_TYPES.map(d => d.toLowerCase());
 const ABILITY_SCORES = ['Strength', 'Dexterity', 'Constitution', 'Intelligence', 'Wisdom', 'Charisma'];
-const WORD_NUMS: Record<string, number> = {
+const WORD_NUMS: Record<string, number> = { another: 1,
     one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9
 };
 const ACT_TYPES: Record<number, { u: string; t: boolean }> = {
@@ -82,7 +82,8 @@ export class ExtractionService {
 
     /** Strips HTML tags and normalises whitespace. Used everywhere a plain text string is needed.
      *  Injects spaces at block-element boundaries so "None</p><p>Weapons:" → "None Weapons:"
-     *  rather than "NoneWeapons:". */
+     *  rather than "NoneWeapons:". Also normalises curly/smart apostrophes to straight so tool
+     *  and skill names match their list entries (e.g. "Cook\u2019s" → "Cook's"). */
     static cleanText(html: string | null | undefined): string {
         if (!html) return '';
         // Pre-process: replace block element open/close tags with a space so adjacent
@@ -92,9 +93,16 @@ export class ExtractionService {
             .replace(/<(p|br|div|li|tr|td|th|h[1-6])[^>]*>/gi, ' ');
         try {
             const doc = new DOMParser().parseFromString(spaced, 'text/html');
-            return (doc.body.textContent ?? '').replace(/\s+/g, ' ').trim();
+            return (doc.body.textContent ?? '')
+                .replace(/[\u2018\u2019\u201A\u201B\u02BC]/g, "'")  // curly/smart apostrophes → straight
+                .replace(/\s+/g, ' ')
+                .trim();
         } catch {
-            return spaced.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+            return spaced
+                .replace(/<[^>]+>/g, '')
+                .replace(/[\u2018\u2019\u201A\u201B\u02BC]/g, "'")
+                .replace(/\s+/g, ' ')
+                .trim();
         }
     }
 
@@ -301,13 +309,12 @@ export class ExtractionService {
         return type ? `${diceStr} ${type}` : diceStr;
     }
 
-    // ── Comprehensive 3-tier proficiency extractor ────────────────────────────
-    // Tier 1: combined "N skills or tools" pattern
-    // Tier 2: labeled sections (Skills:, Tools:, Languages:)
-    // Tier 3: unlabeled patterns in plain text
+    // ── Proficiency extractor — holistic rewrite ──────────────────────────────
+    // Designed from corpus analysis of 3,346 proficiency-relevant sentences across
+    // all payload types. Patterns are semantically broad — prepositions, word order,
+    // and trailing phrases vary widely across editions and third-party sources.
 
-    /** Extracts text following a label, stopping at the next known section label or newline.
-     *  Prevents "Tools: None Saving Throws: ... Skills: Choose two" from bleeding across sections. */
+    /** Extracts text following a label, stopping at the next known section label or newline. */
     private static sectionText(text: string, labelRe: RegExp): string | null {
         const m = text.match(labelRe);
         if (!m) return null;
@@ -317,13 +324,31 @@ export class ExtractionService {
         return stopM ? after.slice(0, stopM.index) : after.slice(0, 300);
     }
 
-    static extractProficiencies(text: string): ProficiencyResult {
-        let skillCount = 0, skillPool = '', skillGrants = '';
-        let toolCount = 0, toolPool = '', toolGrants = '';
-        let langCount = 0, langPool = '', langGrants = '';
-        let stCount = 0, stPool = '', stGrants = '';
+    /** Extract a number word/digit from a string. */
+    private static numOf(s: string): number {
+        const m = s.match(/\b(one|two|three|four|five|six|\d+)\b/i);
+        return m ? (WORD_NUMS[m[1].toLowerCase()] ?? parseInt(m[1]) ?? 0) : 0;
+    }
 
-        // ── Tier 1: Combined "N skills or tools" ──────────────────────────────
+    /** Extract skills listed after "from" / "following list" / ": X, Y, Z" */
+    private static poolFrom(text: string, afterIdx: number): string {
+        const after = text.slice(afterIdx, afterIdx + 300);
+        const m = after.match(/(?:(?:from(?:\s+(?:among|the\s+following))?|following\s+skills?)[^:]*:?\s*)([A-Za-z,\s]+?)(?:\.|;|and\s+[A-Z]|$)/i);
+        if (!m) return '';
+        return m[1].split(/[,\s]+(?:and\s+|or\s+)?/i).map(s => s.trim()).filter(s => SKILLS.includes(s)).join(',');
+    }
+
+    static extractProficiencies(text: string): ProficiencyResult {
+        const empty: ProficiencyResult = { skillCount: 0, skillPool: '', skillGrants: '', toolCount: 0, toolPool: '', toolGrants: '', langCount: 0, langPool: '', langGrants: '', stCount: 0, stPool: '', stGrants: '' };
+
+        // Early exit
+        if (!/proficien|expertise|language/i.test(text)) return empty;
+
+        let { skillCount, skillPool, skillGrants, toolCount, toolPool, toolGrants,
+              langCount, langPool, langGrants, stCount, stPool, stGrants } = empty;
+
+
+        // ── COMBINED: "N skills or tools" ────────────────────────────────────
         const combinedM = text.match(/(\w+)\s+(?:skills?\s+or\s+tools?|tools?\s+or\s+skills?)\s*(?:of\s+your\s+choice)?/i);
         if (combinedM) {
             const n = parseWordCount(combinedM[1]);
@@ -333,8 +358,13 @@ export class ExtractionService {
             }
         }
 
-        // ── Tier 2: Labeled sections ──────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
+        // SKILLS
+        // Priority: labeled section → explicit count → named choices → named grants
+        // ════════════════════════════════════════════════════════════════════
+
         if (!skillCount && !skillGrants) {
+            // 1. Labeled section "Skills:" or "Skill Proficiencies:"
             const sec = ExtractionService.sectionText(text, /Skills?(?:\s+Proficiencies)?[:\t]/i);
             if (sec !== null) {
                 const cm = sec.match(/Choose\s+(?:any\s+)?(\w+)/i);
@@ -342,8 +372,8 @@ export class ExtractionService {
                 if (/choose\s+any/i.test(sec) && n > 0) {
                     skillCount = n; skillPool = SKILLS.join(',');
                 } else if (n > 0) {
-                    const pm = sec.match(/(?:from among|from)\s+([A-Za-z ,']+?)(?:\.|;|$|\n)/i);
-                    const pool = pm ? pm[1].split(/,/).map(s => s.replace(/\s+or\s*$/i, '').trim()).filter(s => SKILLS.includes(s)).join(',') : '';
+                    const pm = sec.match(/(?:from(?:\s+among)?|following)[^:]*:?\s*([A-Za-z, ']+?)(?:\.|;|$|\n)/i);
+                    const pool = pm ? pm[1].split(/[,\s]+(?:or\s+|and\s+)?/i).map(s => s.replace(/\s*or\s*$/i,'').trim()).filter(s => SKILLS.includes(s)).join(',') : '';
                     skillCount = n; skillPool = pool || SKILLS.join(',');
                 } else {
                     const items = sec.split(/[,;]|\s+and\s+/i).map(s => s.trim()).filter(s => SKILLS.includes(s));
@@ -352,8 +382,93 @@ export class ExtractionService {
             }
         }
 
+        if (!skillCount && !skillGrants) {
+            // 2. "proficiency in all skills"
+            if (/proficien\w*\s+in\s+all\s+skills?/i.test(text)) {
+                skillGrants = SKILLS.join(',');
+            }
+        }
+
+        if (!skillCount && !skillGrants) {
+            //    Covers: proficiency in/with N skills, gain N skill proficiencies, choose N skills
+            //    Two safe patterns without open-class backtracking quantifiers
+            const cmA = text.match(/(?:proficien\w*|gain|choose|have)\s+(one|two|three|four|five|six|another|\d+)\s+(?:more\s+)?(?:additional\s+)?(?:of\s+(?:your|the)\s+)?(?:skill\s+proficiencies?|skills?)(?:\s+(?:of\s+your\s+choice|from\b))?/i);
+            const cmB = cmA ? null : text.match(/(one|two|three|four|five|six|another|\d+)\s+(?:more\s+)?(?:additional\s+)?skill\s+proficiencies?\b/i);
+            const cm = cmA ?? cmB;
+            if (cm) {
+                const rawN = cm[1] || '';
+                const n = WORD_NUMS[rawN.toLowerCase()] ?? parseInt(rawN) ?? 0;
+                if (n > 0 && !/doubled|expertise\b/i.test(text.slice(0, (cm.index ?? 0) + 30))) {
+                    // Not an expertise "choose N" — that's handled by extractExpertise
+                    const pool = ExtractionService.poolFrom(text, (cm.index ?? 0) + cm[0].length);
+                    skillCount = n; skillPool = pool || SKILLS.join(',');
+                }
+            }
+        }
+
+        if (!skillCount && !skillGrants) {
+            // 4. "proficiency in [Skill] and [Skill]" or "proficiency in the [Skill] skill"
+            //    or "proficiency in one of the following skills of your choice: X, Y, Z"
+            const choiceListM = text.match(/proficien\w*\s+in\s+one\s+of\s+the\s+following\s+skills?\s+of\s+your\s+choice[^:]*:\s*([A-Za-z,\s]+?)(?:\.|;|$)/i)
+                             ?? text.match(/proficien\w*\s+in\s+(?:two|three|four)\s+of\s+the\s+following\s+skills?[^:]*:\s*([A-Za-z,\s]+?)(?:\.|;|$)/i);
+            if (choiceListM) {
+                const listed = choiceListM[1].split(/[,\s]+(?:and\s+|or\s+)?/i).map(s => s.trim()).filter(s => SKILLS.includes(s));
+                const countM = choiceListM[0].match(/(one|two|three|four|\d+)/i);
+                const n = countM ? (WORD_NUMS[countM[1].toLowerCase()] ?? 1) : 1;
+                skillCount = n; skillPool = listed.join(',') || SKILLS.join(',');
+            } else {
+                // Named skill grants: "gain proficiency in [Skill]"
+                const hasChoiceContext = /(?:proficien\w*|gain|choose)[^.]{0,120}choose/i.test(text);
+                if (!hasChoiceContext) {
+                    const found = SKILLS.filter(s => {
+                        const re = new RegExp(`proficien\\w*\\s+(?:in|with)(?:\\s+\\w+){0,3}\\s+${s.replace(/\s+/g,'\\s+')}\\b`, 'i');
+                        return re.test(text);
+                    });
+                    if (found.length) skillGrants = found.join(',');
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // SAVING THROWS
+        // ════════════════════════════════════════════════════════════════════
+        if (!stCount && !stGrants) {
+            // 1. Labeled section "Saving Throws:"
+            const sec = ExtractionService.sectionText(text, /Saving\s+Throw(?:s)?\s+Proficiencies?[:\t]|Saving\s+Throws?[:\t]/i);
+            if (sec !== null) {
+                const found = ABILITY_SCORES.filter(v => new RegExp(`\\b${v}\\b`, 'i').test(sec));
+                if (found.length) stGrants = found.join(',');
+            }
+        }
+        if (!stCount && !stGrants) {
+            // 2. PHB 2024 table row: "Saving Throw Proficiencies Strength and Constitution" (no colon)
+            const tableM = text.match(/Saving\s+Throw\s+Proficiencies\s+([A-Z][a-z]+(?:\s+and\s+[A-Z][a-z]+)*)/i);
+            if (tableM) {
+                const found = ABILITY_SCORES.filter(v => new RegExp(`\\b${v}\\b`, 'i').test(tableM[1]));
+                if (found.length) stGrants = found.join(',');
+            }
+        }
+        if (!stCount && !stGrants) {
+            // 3. "gain proficiency in [Stat(s)] saving throws" / "proficiency in all saving throws"
+            if (/proficien\w*\s+in\s+all\s+saving\s+throws?/i.test(text)) {
+                stGrants = ABILITY_SCORES.join(',');
+            } else {
+                const stM = text.match(/proficien\w*\s+in\s+((?:[A-Z][a-z]+(?:,?\s+(?:and\s+)?)?)+)\s+saving\s+throws?/i)
+                         ?? text.match(/proficien\w*\s+in\s+saving\s+throws?\s+using\s+((?:[A-Z][a-z]+(?:,?\s+(?:or\s+|and\s+)?)?)+)/i);
+                if (stM) {
+                    const found = ABILITY_SCORES.filter(v => new RegExp(`\\b${v}\\b`, 'i').test(stM[1]));
+                    if (found.length === 1) stGrants = found[0];
+                    else if (found.length > 1) { stCount = 1; stPool = found.join(','); }
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // TOOLS
+        // ════════════════════════════════════════════════════════════════════
         if (!toolCount && !toolGrants) {
-            const sec = ExtractionService.sectionText(text, /Tools?(?:\s+Proficiencies)?[:\t]/i);
+            // 1. Labeled section "Tools:" / "Tool Proficiencies:"
+            const sec = ExtractionService.sectionText(text, /Tools?(?:\s+Proficiencies?)?[:\t]/i);
             if (sec !== null) {
                 const cm = sec.match(/Choose\s+(?:any\s+)?(\w+)/i);
                 const n = cm ? (WORD_NUMS[cm[1].toLowerCase()] ?? parseInt(cm[1]) ?? 0) : 0;
@@ -364,124 +479,138 @@ export class ExtractionService {
                     toolCount = n; toolPool = f.length ? f.join(',') : ARTISAN_TOOLS.join(',');
                 } else if (n > 0) {
                     const f = TOOLS.filter(t => sec.toLowerCase().includes(t.toLowerCase()));
-                    toolCount = n; toolPool = f.length ? f.join(',') : '';
+                    toolCount = n; toolPool = f.length ? f.join(',') : TOOLS.join(',');
                 } else {
                     const f = TOOLS.filter(t => sec.toLowerCase().includes(t.toLowerCase()));
                     if (f.length) toolGrants = f.join(',');
                 }
             }
         }
+        if (!toolCount && !toolGrants) {
+            // 2. Count patterns: "proficiency with N (type of) Artisan's/Musical/Gaming tools/sets/instruments"
+            //    also: "N tool proficiencies of your choice"
+            const toolCountM = text.match(/proficien\w*\s+with\s+(one|two|three|four|\d+)\s+(?:(?:different|type(?:s)?\s+of)\s+)?(?:Artisan['']?s?\s+Tools?|Musical\s+Instruments?|Gaming\s+Sets?|tools?)(?:\s+of\s+your\s+choice)?/i)
+                            ?? text.match(/(one|two|three|four|\d+)\s+tool\s+proficiencies?\s+of\s+your\s+choice/i)
+                            ?? text.match(/proficien\w*\s+with\s+(two|three|\d+)\s+Artisan['']?s?\s+Tools?/i);
+            if (toolCountM) {
+                const n = ExtractionService.numOf(toolCountM[0]);
+                const seg = toolCountM[0].toLowerCase();
+                const pool = /musical\s+instrument/i.test(seg) ? 'Musical Instrument'
+                           : /gaming\s+set/i.test(seg) ? 'Gaming Set'
+                           : /artisan/i.test(seg) ? ARTISAN_TOOLS.join(',')
+                           : TOOLS.join(',');
+                toolCount = Math.max(n, 1); toolPool = pool;
+            }
+        }
+        if (!toolCount && !toolGrants) {
+            // 3. Named tool grants: "proficiency with [ToolName]" or "have proficiency with it" (after [ToolName])
+            //    Scan all TOOLS — apostrophe normalised by cleanText so straight ' matches
+            const found = TOOLS.filter(t => {
+                const esc = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                // "proficiency with [Tool]" or "[Tool], and ... proficiency with it"
+                return new RegExp(`proficien\\w*\\s+with\\s+(?:\\w+\\s+){0,3}${esc}\\b`, 'i').test(text)
+                    || new RegExp(`${esc}[^.]{0,60}proficiency\\s+with\\s+it\\b`, 'i').test(text);
+            });
+            if (found.length) toolGrants = found.join(',');
+        }
 
-        {
-            const sec = ExtractionService.sectionText(text, /Languages?(?:\s+Proficiencies)?[:\t]/i);
+        // ════════════════════════════════════════════════════════════════════
+        // LANGUAGES
+        // ════════════════════════════════════════════════════════════════════
+        if (!langCount && !langGrants) {
+            // 1. Labeled section
+            const sec = ExtractionService.sectionText(text, /Languages?(?:\s+Proficiencies?)?[:\t]/i);
             if (sec !== null) {
                 const cm = sec.match(/Choose\s+(?:any\s+)?(\w+)/i);
                 const n = cm ? (WORD_NUMS[cm[1].toLowerCase()] ?? parseInt(cm[1]) ?? 0) : 0;
                 if (/choose\s+any/i.test(sec) && n > 0) {
                     langCount = n; langPool = LANGUAGES.join(',');
                 } else if (n > 0) {
-                    const pm = sec.match(/(?:from among|from)\s+([A-Za-z ,']+?)(?:\.|;|$|\n)/i);
-                    const pool = pm ? pm[1].split(/,/).map(s => s.trim()).filter(s => LANGUAGES.includes(s)).join(',') : '';
+                    const pm = sec.match(/(?:from(?:\s+among)?|following)[^:]*:?\s*([A-Za-z, ']+?)(?:\.|;|$|\n)/i);
+                    const pool = pm ? pm[1].split(/[,\s]+(?:or\s+|and\s+)?/i).map(s => s.trim()).filter(s => LANGUAGES.includes(s)).join(',') : '';
                     langCount = n; langPool = pool || LANGUAGES.join(',');
                 } else {
                     const items = sec.split(/[,;]|\s+and\s+/i).map(s => s.trim()).filter(s => LANGUAGES.includes(s));
                     if (items.length) langGrants = items.join(',');
+                    else { langCount = 1; langPool = LANGUAGES.join(','); }
                 }
             }
         }
-
-        // ── Tier 3: Unlabeled patterns ────────────────────────────────────────
-
-        if (!skillCount && !skillGrants) {
-            // Saving throw proficiency
-            const stSec = text.match(/proficien\w*\s+in\s+saving\s+throws?[^.]{0,150}/i);
-            if (stSec) {
-                const seg = stSec[0];
-                if (/chosen\s+ability|your\s+choice/i.test(seg)) {
-                    stCount = 1; stPool = ABILITY_SCORES.join(',');
-                } else {
-                    const found = ABILITY_SCORES.filter(v => new RegExp(`\\b${v}\\b`, 'i').test(seg));
-                    if (found.length === 1) stGrants = found[0];
-                    else if (found.length > 1) { stCount = 1; stPool = found.join(','); }
-                }
-            }
-
-            // All skills at once
-            if (/proficien\w*\s+in\s+all\s+skills?/i.test(text)) {
-                skillGrants = SKILLS.join(',');
-            } else {
-                // "proficiency in N skill(s) of your choice"  — PHB 2014 style
-                // "Skill Proficiencies Choose N from ..." — PHB 2024 style (no colon after label)
-                const choiceM = text.match(/proficien\w*\s+in\s+(one|two|three|four|\d+)\s+(?:additional\s+)?skills?\s*(?:of\s+your\s+choice|from\b)/i)
-                    ?? text.match(/Skill\s+Proficiencies?\s+Choose\s+(one|two|three|\d+)/i)
-                    ?? text.match(/proficien\w*\s+Choose\s+(one|two|three|\d+)\s+(?:from\s+)?skills?/i);
-                if (choiceM) {
-                    const n = parseWordCount(choiceM[1]);
-                    const afterIdx = text.search(choiceM[0]) + choiceM[0].length;
-                    const afterText = text.slice(afterIdx, afterIdx + 200);
-                    const fromM = afterText.match(/(?:following|options?)[^:]*:\s*([A-Za-z,\s]+?)(?:\.|$|\r|\n)/i);
-                    let pool = '';
-                    if (fromM) {
-                        const listed = fromM[1].split(/[,\s]+(?:or\s+|and\s+)?/i).map(s => s.trim()).filter(s => SKILLS.includes(s));
-                        pool = listed.join(',');
-                    }
-                    skillCount = n; skillPool = pool || SKILLS.join(',');
-                } else {
-                    // "proficiency in Stealth or Athletics (your choice)"
-                    const eitherM = text.match(/proficien\w*\s+in\s+(?:either\s+)?(?:the\s+)?([A-Z][a-z\s]+?)\s+(?:or|and)\s+([A-Z][a-z]+)\s+skills?/i);
-                    if (eitherM) {
-                        const valid = [eitherM[1].trim(), eitherM[2].trim()].filter(s => SKILLS.includes(s));
-                        if (valid.length) { skillCount = 1; skillPool = valid.join(','); }
-                    } else {
-                        // Fixed named skills — only extract if there is no "Choose" nearby,
-                        // which would indicate these are choice options, not fixed grants.
-                        const hasChoiceContext = /proficien\w*[^.]{0,120}choose/i.test(text);
-                        if (!hasChoiceContext) {
-                            const found = SKILLS.filter(s => {
-                                const re = new RegExp(`\\bproficien\\w*\\b[^.]{0,80}\\b${s.replace(/\s+/g, '\\s+')}\\b`, 'i');
-                                return re.test(text);
-                            });
-                            if (found.length) skillGrants = found.join(',');
-                        }
-                    }
-                }
+        if (!langCount && !langGrants) {
+            // 2. Inline: "learn/know/speak N language(s) of your choice"
+            //    "gain ... one language of your choice"
+            const langCountM = text.match(/(?:learn|know|speak|gain\s+proficien\w*\s+in|you\s+(?:learn|know))\s+(one|two|three|\d+)\s+(?:additional\s+)?languages?\s+(?:of\s+your\s+choice|you\s+(?:roll|choose))/i)
+                            ?? text.match(/(?:learn|know)\s+one\s+(?:additional\s+)?language\b/i)
+                            ?? text.match(/one\s+language\s+of\s+your\s+choice/i);
+            if (langCountM) {
+                const n = ExtractionService.numOf(langCountM[0]);
+                langCount = Math.max(n, 1); langPool = LANGUAGES.join(',');
             }
         }
-
-        if (!toolCount && !toolGrants) {
-            // "proficiency with N [artisan/musical/gaming/] tools of your choice"
-            const toolChoiceM = text.match(/proficien\w*\s+with\s+(?:one|two|three|four|a|an|\d+)\s+(?:different\s+)?(?:type(?:s)?\s+of\s+)?(?:artisan['\s]?s?\s+)?(?:Musical\s+Instrument|Gaming\s+Set|tool)s?(?:\s+of\s+your\s+choice)?/i);
-            if (toolChoiceM) {
-                const nm = toolChoiceM[0].match(/\b(one|two|three|four|a|an|\d+)\b/i);
-                const n = nm ? (WORD_NUMS[nm[1].toLowerCase()] ?? 1) : 1;
-                const seg = toolChoiceM[0].toLowerCase();
-                let pool: string;
-                if (/musical\s+instrument/i.test(seg)) pool = 'Musical Instrument';
-                else if (/gaming\s+set/i.test(seg)) pool = 'Gaming Set';
-                else if (/artisan/i.test(seg)) pool = ARTISAN_TOOLS.join(',');
-                else pool = TOOLS.join(',');
-                toolCount = n; toolPool = pool;
-            } else {
-                // Fixed named tools
-                const found = TOOLS.filter(t => {
-                    const re = new RegExp(`\\bproficien\\w*[^.]{0,80}\\b${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                    return re.test(text);
-                });
-                if (found.length) toolGrants = found.join(',');
-            }
+        if (!langCount && !langGrants) {
+            // 3. Named language grants
+            const found = LANGUAGES.filter(l => new RegExp(`\\b${l}\\b`, 'i').test(text));
+            if (found.length) langGrants = found.join(',');
         }
 
         return { skillCount, skillPool, skillGrants, toolCount, toolPool, toolGrants, langCount, langPool, langGrants, stCount, stPool, stGrants };
     }
 
-    // ── Grant row builders ────────────────────────────────────────────────────
+
+        // ── Grant row builders ────────────────────────────────────────────────────
 
     /** Full common grant fields — for classFeatures, subclassFeatures, feats. */
+    // ── Expertise extraction ─────────────────────────────────────────────────
+    // Detects "choose N of your skill proficiencies... proficiency bonus is doubled"
+    // and "choose N skills... expertise" patterns.
+
+    static extractExpertise(text: string): { count: number; pool: string } {
+        // "choose two of your skill proficiencies. Your proficiency bonus is doubled"
+        // "choose two skills... gaining expertise"
+        // "doubled" or "expertise" may appear in a different sentence from "choose N skill proficiencies"
+        // so we check for the choice pattern first, then verify the full text signals expertise.
+        const isExpertiseContext = /\b(?:doubled|expertise)\b/i.test(text);
+        if (!isExpertiseContext) return { count: 0, pool: '' };
+
+        const m = text.match(
+            /choose\s+(one|two|three|four|\d+)\s+(?:more\s+)?(?:of\s+your\s+)?(?:skill\s+proficiencies?|skills?)/i
+        ) ?? text.match(
+            /expertise\s[^.]{0,120}choose\s+(one|two|three|four|\d+)\s+(?:skill|proficien)/i
+        );
+        if (!m) return { count: 0, pool: '' };
+        const n = WORD_NUMS[m[1]?.toLowerCase()] ?? parseInt(m[1]) ?? 0;
+        // Check if specific skills are listed after "from" or "among"
+        const afterIdx = text.indexOf(m[0]) + m[0].length;
+        const afterText = text.slice(afterIdx, afterIdx + 200);
+        const fromM = afterText.match(/(?:from(?:\s+among)?|following)[^:]*:\s*([A-Za-z,\s]+?)(?:\.|$)/i);
+        let pool = '';
+        if (fromM) {
+            const listed = fromM[1].split(/[,\s]+(?:and\s+|or\s+)?/i).map(s => s.trim()).filter(s => SKILLS.includes(s));
+            pool = listed.join(',');
+        }
+        return { count: n, pool: pool || SKILLS.join(',') };
+    }
+
+    // ── Half proficiency extraction ───────────────────────────────────────────
+    // Detects "half your proficiency bonus... any ability check" (Jack of All Trades)
+    // and similar patterns that grant half proficiency to all skills.
+
+    static extractHalfProficiency(text: string): string {
+        if (/half\s+(?:your\s+)?proficiency\s+bonus[^.]{0,150}any\s+ability\s+check/i.test(text)) {
+            return SKILLS.join(',');
+        }
+        return '';
+    }
+
     static buildGrantRow(text: string): Record<string, unknown> {
         const p = ExtractionService.extractProficiencies(text);
         const st = p.stGrants || ExtractionService.extractSavingThrows(text);
+        const expertise = ExtractionService.extractExpertise(text);
+        const halfSkills = ExtractionService.extractHalfProficiency(text);
         return {
-            grantsSkills: p.skillGrants, grantsExpertise: '', grantsHalfSkills: '',
+            grantsSkills: p.skillGrants, grantsExpertise: '',
+            grantsHalfSkills: halfSkills,
+            expertiseChoiceCount: expertise.count || '', expertiseChoicePool: expertise.pool,
             grantsSavingThrows: st,
             skillChoiceCount: p.skillCount || '', skillChoicePool: p.skillPool,
             savingThrowChoiceCount: p.stCount || '', savingThrowChoicePool: p.stPool,
@@ -526,7 +655,9 @@ export class ExtractionService {
     /** Empty grant row — used as a fallback or starting point. */
     static getEmptyGrants(): Record<string, string> {
         return {
-            grantsSkills: '', grantsExpertise: '', grantsHalfSkills: '', grantsSavingThrows: '',
+            grantsSkills: '', grantsExpertise: '', grantsHalfSkills: '',
+            expertiseChoiceCount: '', expertiseChoicePool: '',
+            grantsSavingThrows: '',
             skillChoiceCount: '', skillChoicePool: '', savingThrowChoiceCount: '', savingThrowChoicePool: '',
             grantsTools: '', toolChoiceCount: '', toolChoicePool: '',
             grantsLanguages: '', languageChoiceCount: '', languageChoicePool: '',

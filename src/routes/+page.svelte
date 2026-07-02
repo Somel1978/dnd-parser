@@ -1,152 +1,222 @@
 <script lang="ts">
-    import { parserContext } from '$lib/parsers/ParserContext.svelte';
-    import { ClassParser } from '$lib/parsers/ClassParser';
-    import { SubclassParser } from '$lib/parsers/SubclassParser';
-    import { SpeciesParser } from '$lib/parsers/SpeciesParser';
-    import { FeatParser } from '$lib/parsers/FeatParser';
-    import { BackgroundParser } from '$lib/parsers/BackgroundParser';
-    import { SpellParser } from '$lib/parsers/SpellParser';
-    import { downloadExcel } from '$lib/utils/excel';
+    type FileKey = 'classes' | 'subclasses' | 'species' | 'backgrounds' | 'feats' | 'spells';
 
-    let rawJson = $state('');
-    let selectedType = $state('classes');
-    let error = $state<string | null>(null);
-    
-    type ResultData = { rows: Record<string, unknown>[], sheet: string, file: string };
-    let results = $state<Record<string, ResultData> | null>(null);
+    const SECTIONS = [
+        {
+            key: 'class' as const,
+            title: 'Class Dependent',
+            payloads: [
+                { key: 'classes' as FileKey,    label: 'Classes',    hint: 'Required first — builds class registry for subclasses' },
+                { key: 'subclasses' as FileKey, label: 'Subclasses', hint: 'Requires Classes to be processed first' },
+            ]
+        },
+        { key: 'species' as const, title: 'Species', payloads: [{ key: 'species' as FileKey, label: 'Species & Traits', hint: '' }] },
+        { key: 'backgrounds' as const, title: 'Backgrounds', payloads: [{ key: 'backgrounds' as FileKey, label: 'Backgrounds', hint: '' }] },
+        { key: 'feats' as const, title: 'Feats', payloads: [{ key: 'feats' as FileKey, label: 'Feats', hint: '' }] },
+        { key: 'spells' as const, title: 'Spells', payloads: [{ key: 'spells' as FileKey, label: 'Spells', hint: '' }] },
+    ];
 
-    // UX States
-    let isProcessing = $state(false);
-    let downloadingStates = $state<Record<string, boolean>>({});
+    let files    = $state<Partial<Record<FileKey, File>>>({});
+    let status   = $state<Partial<Record<FileKey, 'idle'|'processing'|'done'|'error'>>>({});
+    let errors   = $state<Partial<Record<FileKey, string>>>({});
+    let results  = $state<Partial<Record<FileKey, Record<string,string>>>>({});  // filename → base64
 
-    async function processPayload() {
-        error = null;
-        results = null;
-        isProcessing = true;
+    // classMap persisted between Classes and Subclasses runs
+    let classMap = $state<[number,{name:string;uploadId:string}][] | null>(null);
 
-        // Yield to the browser to paint the "Processing..." button state
-        await new Promise(resolve => setTimeout(resolve, 50));
+    const classesLoaded = $derived(classMap !== null && classMap.length > 0);
+
+    function handleFile(key: FileKey, e: Event) {
+        const input = e.currentTarget as HTMLInputElement;
+        files[key] = input.files?.[0] ?? undefined;
+        errors[key] = undefined;
+        results[key] = undefined;
+        if (status[key] !== 'processing') status[key] = 'idle';
+    }
+
+    async function convert(key: FileKey) {
+        const file = files[key];
+        if (!file) return;
+        status[key] = 'processing';
+        errors[key] = undefined;
+        results[key] = undefined;
 
         try {
-            const data = JSON.parse(rawJson);
-            const payload = data.data || data.results || (Array.isArray(data) ? data : [data]);
+            const form = new FormData();
+            form.append('type', key);
+            form.append('file', file);
+            if (key === 'subclasses' && classMap) {
+                form.append('classMap', JSON.stringify(classMap));
+            }
 
-            if (selectedType === 'classes') {
-                const parser = new ClassParser(parserContext);
-                results = parser.execute(payload) as Record<string, ResultData>;
-            } else if (selectedType === 'subclasses') {
-                const parser = new SubclassParser(parserContext);
-                results = parser.execute(payload) as Record<string, ResultData>;
-            } else if (selectedType === 'species') {
-                const parser = new SpeciesParser(parserContext);
-                results = parser.execute(payload) as Record<string, ResultData>;
-            } else if (selectedType === 'feats') {
-                const parser = new FeatParser(parserContext);
-                results = parser.execute(payload) as Record<string, ResultData>;
-            } else if (selectedType === 'backgrounds') {
-                const parser = new BackgroundParser(parserContext);
-                results = parser.execute(payload) as Record<string, ResultData>;
-            } else if (selectedType === 'spells') {
-                const parser = new SpellParser(parserContext);
-                results = parser.execute(payload) as Record<string, ResultData>;
-            }
-            
+            const res = await fetch('/api/process', { method: 'POST', body: form });
+            const json = await res.json() as { files?: Record<string,string>; classMap?: [number,{name:string;uploadId:string}][]; error?: string };
+
+            if (!res.ok || json.error) throw new Error(json.error ?? `HTTP ${res.status}`);
+
+            results[key] = json.files ?? {};
+            if (json.classMap) classMap = json.classMap;
+            status[key] = 'done';
         } catch (err) {
-            if (err && typeof err === 'object' && 'issues' in err) {
-                const zodError = err as { issues: { message: string }[] };
-                error = `Validation Failed: ${zodError.issues[0].message}`;
-            } else if (err instanceof Error) {
-                error = err.message;
-            } else {
-                error = 'An unknown processing error occurred.';
-            }
-        } finally {
-            isProcessing = false;
+            errors[key] = err instanceof Error ? err.message : String(err);
+            status[key] = 'error';
         }
     }
 
-    async function handleDownload(rows: Record<string, unknown>[], sheet: string, file: string) {
-        // Prevent double clicks
-        if (downloadingStates[file]) return;
-        
-        downloadingStates[file] = true;
-
-        // Yield to the browser to paint the "Building file..." text before the thread blocks
-        await new Promise(resolve => setTimeout(resolve, 50));
-
-        try {
-            downloadExcel(rows, sheet, file);
-        } catch (err) {
-            error = "Failed to build Excel file.";
-            console.error(err);
-        } finally {
-            downloadingStates[file] = false;
-        }
+    function download(filename: string, b64: string) {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = filename; a.click();
+        URL.revokeObjectURL(url);
     }
 </script>
 
-<div style="font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px;">
-    <h1 style="font-size: 24px; font-weight: bold; margin-bottom: 8px;">D&D 5e Import Converter</h1>
-    <p style="color: #666; margin-bottom: 24px;">Strict Typed Architecture</p>
+<style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :global(body) { font-family: 'Inter', system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; }
 
-    <div style="margin-bottom: 16px;">
-        <label for="payloadType" style="display: block; font-size: 14px; font-weight: 500; margin-bottom: 8px;">Payload Type</label>
-        <select id="payloadType" bind:value={selectedType} disabled={isProcessing} style="padding: 8px; border: 1px solid #ccc; border-radius: 4px; width: 200px; background: {isProcessing ? '#f3f4f6' : '#fff'};">
-            <option value="classes">Classes</option>
-            <option value="subclasses">Subclasses</option>
-            <option value="species">Species</option>
-            <option value="feats">Feats</option>
-            <option value="backgrounds">Backgrounds</option>
-            <option value="spells">Spells</option>
-        </select>
-    </div>
+    .app { max-width: 760px; margin: 0 auto; padding: 2rem 1.5rem 4rem; }
+    h1 { font-size: 1.375rem; font-weight: 700; color: #f8fafc; margin-bottom: 0.25rem; }
+    .subtitle { font-size: 0.8125rem; color: #475569; margin-bottom: 2rem; }
 
-    <div style="margin-bottom: 16px;">
-        <label for="rawJson" style="display: block; font-size: 14px; font-weight: 500; margin-bottom: 8px;">Paste JSON Payload</label>
-        <textarea 
-            id="rawJson"
-            bind:value={rawJson} 
-            disabled={isProcessing}
-            rows="10" 
-            style="width: 100%; padding: 12px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 12px; background: {isProcessing ? '#f3f4f6' : '#fff'};"
-            placeholder="Accepts raw array or DDB wrapped payload..."
-        ></textarea>
-    </div>
+    .section { background: #131820; border: 1px solid #1e2840; border-radius: 10px; margin-bottom: 1rem; overflow: hidden; }
+    .section-head { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1.125rem; background: #0d1220; border-bottom: 1px solid #1e2840; }
+    .section-title { font-size: 0.6875rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b; }
+    .badge { font-size: 0.625rem; font-weight: 700; padding: 0.125rem 0.5rem; border-radius: 99px; background: #14532d33; color: #86efac; border: 1px solid #14532d66; }
+    .section-body { padding: 1rem 1.125rem; display: flex; flex-direction: column; gap: 1rem; }
 
-    <button 
-        onclick={processPayload}
-        disabled={isProcessing}
-        style="background: {isProcessing ? '#93c5fd' : '#2563eb'}; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: {isProcessing ? 'wait' : 'pointer'}; font-weight: 500; transition: background 0.2s;"
-    >
-        {isProcessing ? '⏳ Parsing JSON...' : 'Process Payload'}
-    </button>
+    .payload { display: flex; flex-direction: column; gap: 0.5rem; }
+    .payload + .payload { padding-top: 1rem; border-top: 1px solid #1e2840; }
+    .payload-label { font-size: 0.75rem; font-weight: 600; color: #94a3b8; display: flex; align-items: center; gap: 0.5rem; }
+    .hint { font-size: 0.6875rem; color: #334155; }
+    .dep-ok   { font-size: 0.6875rem; color: #4ade80; font-weight: 500; }
+    .dep-warn { font-size: 0.6875rem; color: #fb923c; font-weight: 500; }
 
-    {#if error}
-        <div style="margin-top: 20px; padding: 12px; background: #fee2e2; color: #991b1b; border-radius: 4px; font-size: 14px;">
-            {error}
-        </div>
-    {/if}
+    .file-row { display: flex; gap: 0.625rem; align-items: center; }
+    .file-wrap { flex: 1; }
+    input[type="file"] {
+        width: 100%; padding: 0.5rem 0.75rem; background: #0b0f1a;
+        border: 1px solid #1e2840; border-radius: 6px; color: #64748b;
+        font-size: 0.75rem; cursor: pointer;
+    }
+    input[type="file"]:disabled { opacity: 0.4; cursor: not-allowed; }
+    input[type="file"]::file-selector-button {
+        background: #1e2840; border: none; color: #94a3b8;
+        padding: 0.25rem 0.625rem; border-radius: 4px;
+        font-size: 0.6875rem; font-weight: 600; cursor: pointer; margin-right: 0.625rem;
+    }
 
-    {#if results}
-        <div style="margin-top: 24px;">
-            <h2 style="font-size: 18px; font-weight: bold; margin-bottom: 16px;">Ready for Download</h2>
-            {#each Object.values(results) as result (result.file)}
-                <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; margin-bottom: 8px;">
-                    <div>
-                        <strong style="font-size: 14px;">{result.file}</strong>
-                        <span style="margin-left: 8px; font-size: 12px; padding: 2px 8px; background: #dcfce3; color: #166534; border-radius: 12px;">
-                            {result.rows.length} rows
-                        </span>
+    .btn {
+        flex-shrink: 0; font-size: 0.75rem; font-weight: 600;
+        padding: 0.4375rem 1rem; border: none; border-radius: 5px;
+        cursor: pointer; white-space: nowrap;
+    }
+    .btn-primary { background: #1d4ed8; color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: #2563eb; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #1e2840; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .results { display: flex; flex-wrap: wrap; gap: 0.375rem; padding-top: 0.25rem; }
+    .chip { display: flex; align-items: center; gap: 0.375rem; padding: 0.3125rem 0.5rem 0.3125rem 0.625rem; background: #0b1120; border: 1px solid #1e2840; border-radius: 5px; }
+    .chip-name { font-size: 0.6875rem; color: #475569; font-family: monospace; }
+    .btn-dl { font-size: 0.6875rem; font-weight: 700; padding: 0.1875rem 0.5rem; border: 1px solid #14532d88; border-radius: 4px; cursor: pointer; background: transparent; color: #4ade80; }
+    .btn-dl:hover { background: #14532d44; }
+
+    .error { font-size: 0.75rem; color: #fca5a5; background: #1f0f0f; border: 1px solid #7f1d1d44; border-radius: 4px; padding: 0.5rem 0.75rem; }
+
+    .cache-bar { display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 1.125rem; border-top: 1px solid #1e2840; background: #0d1220; }
+    .cache-label { font-size: 0.6875rem; color: #334155; }
+    .cache-ok { font-size: 0.6875rem; color: #4ade80; font-weight: 600; }
+    .btn-clear { margin-left: auto; font-size: 0.6875rem; padding: 0.25rem 0.625rem; border: 1px solid #1e2840; border-radius: 4px; background: transparent; color: #475569; cursor: pointer; }
+    .btn-clear:hover { color: #f87171; border-color: #f87171; }
+</style>
+
+<div class="app">
+    <h1>D&amp;D 5e Import Converter</h1>
+    <p class="subtitle">Convert D&amp;D Beyond JSON payloads into platform import files — processing runs server-side</p>
+
+    {#each SECTIONS as section (section.key)}
+        <div class="section">
+            <div class="section-head">
+                <span class="section-title">{section.title}</span>
+                {#if section.payloads.some(p => status[p.key] === 'done')}
+                    <span class="badge">✓ done</span>
+                {/if}
+                {#if section.payloads.some(p => status[p.key] === 'processing')}
+                    <div class="spinner"></div>
+                {/if}
+            </div>
+
+            <div class="section-body">
+                {#each section.payloads as payload (payload.key)}
+                    {@const key = payload.key}
+                    {@const isSubclasses = key === 'subclasses'}
+                    {@const disabled = isSubclasses && !classesLoaded}
+                    <div class="payload">
+                        <div class="payload-label">
+                            {payload.label}
+                            {#if payload.hint && !isSubclasses}
+                                <span class="hint">{payload.hint}</span>
+                            {/if}
+                            {#if isSubclasses}
+                                {#if classesLoaded}
+                                    <span class="dep-ok">✓ {classMap?.length} classes loaded</span>
+                                {:else}
+                                    <span class="dep-warn">⚠ convert Classes first</span>
+                                {/if}
+                            {/if}
+                        </div>
+                        <div class="file-row">
+                            <div class="file-wrap">
+                                <input type="file" accept=".json,.txt"
+                                    disabled={disabled || status[key] === 'processing'}
+                                    onchange={(e) => handleFile(key, e)} />
+                            </div>
+                            <button class="btn btn-primary"
+                                disabled={!files[key] || disabled || status[key] === 'processing'}
+                                onclick={() => convert(key)}>
+                                {#if status[key] === 'processing'}
+                                    <div class="spinner"></div>
+                                {:else}
+                                    Convert
+                                {/if}
+                            </button>
+                        </div>
+
+                        {#if errors[key]}
+                            <div class="error">{errors[key]}</div>
+                        {/if}
+
+                        {#if results[key]}
+                            <div class="results">
+                                {#each Object.entries(results[key]!) as [filename, b64] (filename)}
+                                    <div class="chip">
+                                        <span class="chip-name">{filename}</span>
+                                        <button class="btn-dl" onclick={() => download(filename, b64)}>↓</button>
+                                    </div>
+                                {/each}
+                            </div>
+                        {/if}
                     </div>
-                    <button 
-                        onclick={() => handleDownload(result.rows, result.sheet, result.file)}
-                        disabled={downloadingStates[result.file]}
-                        style="background: {downloadingStates[result.file] ? '#9ca3af' : '#16a34a'}; color: white; padding: 6px 12px; border: none; border-radius: 4px; cursor: {downloadingStates[result.file] ? 'wait' : 'pointer'}; font-size: 12px; font-weight: 500; min-width: 110px; transition: background 0.2s;"
-                    >
-                        {downloadingStates[result.file] ? '⏳ Building...' : '↓ Download'}
-                    </button>
+                {/each}
+            </div>
+
+            {#if section.key === 'class'}
+                <div class="cache-bar">
+                    <span class="cache-label">Class cache</span>
+                    {#if classesLoaded}
+                        <span class="cache-ok">{classMap?.length} classes in session</span>
+                    {:else}
+                        <span class="cache-label">empty</span>
+                    {/if}
+                    <button class="btn-clear" onclick={() => { classMap = null; }}>Clear</button>
                 </div>
-            {/each}
+            {/if}
         </div>
-    {/if}
+    {/each}
 </div>

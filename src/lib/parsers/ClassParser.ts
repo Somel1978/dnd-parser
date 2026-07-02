@@ -31,10 +31,13 @@ function spellRuleLength(collection: unknown): number {
     return 0;
 }
 
+/** Yield to the browser event loop. */
+const tick = () => new Promise<void>(r => setTimeout(r, 0));
+
 export class ClassParser {
     constructor(private context: ParserContext) {}
 
-    execute(rawData: unknown) {
+    async execute(rawData: unknown) {
         const parsedData: ClassData[] = z.array(DdbClassSchema).parse(rawData);
 
         // Deduplicate within same sourceId (repeatable instances); keep all source versions.
@@ -43,8 +46,10 @@ export class ClassParser {
 
         // Register ALL class ID → name mappings before processing.
         // Subclasses reference parentClassId which may belong to any version.
+        let clsIdx = 0;
         for (const cls of deduped) {
-            this.context.registerClass(cls.id, cls.name);
+            if (clsIdx++ % 10 === 0) await tick();
+            this.context.registerClass(cls.id, cls.name, `${cls.sources?.[0]?.sourceId ?? 0}:${cls.name}`);
         }
 
         const classRows: Record<string, unknown>[] = [];
@@ -93,6 +98,7 @@ export class ClassParser {
                 const featName   = stripLevelPrefix(feature.name ?? '');
                 featureRows.push({
                     uploadId: `${featSrcId}:${cls.name}:${featName}:${feature.requiredLevel ?? 1}`,
+                    classUploadId: uploadId,
                     className: cls.name,
                     name: featName,
                     requiredLevel: feature.requiredLevel ?? 1,
@@ -115,7 +121,7 @@ export class ClassParser {
                 const slots: number[] = Array.isArray(slotSource) ? slotSource : [];
 
                 spellSlotRows.push({
-                    'Class Name': cls.name, 'Subclass Name': '', 'Caster Type': ctType, 'Level': lv,
+                    'Class Name': cls.name, 'Subclass Name': '', 'Class Upload ID': uploadId, 'Caster Type': ctType, 'Level': lv,
                     'Slot 1': slots[0] ?? 0, 'Slot 2': slots[1] ?? 0, 'Slot 3': slots[2] ?? 0,
                     'Slot 4': slots[3] ?? 0, 'Slot 5': slots[4] ?? 0, 'Slot 6': slots[5] ?? 0,
                     'Slot 7': slots[6] ?? 0, 'Slot 8': slots[7] ?? 0, 'Slot 9': slots[8] ?? 0
@@ -129,7 +135,7 @@ export class ClassParser {
                         : null;
 
                 spellsKnownRows.push({
-                    'Class Name': cls.name, 'Subclass Name': '', 'Level': lv,
+                    'Class Name': cls.name, 'Subclass Name': '', 'Class Upload ID': uploadId, 'Level': lv,
                     'Cantrips': cantrips ?? '',
                     'Prepared': prepared ?? '',
                     'Additional': '', 'Note': ''

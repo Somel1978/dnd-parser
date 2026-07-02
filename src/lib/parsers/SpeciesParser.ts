@@ -51,7 +51,8 @@ export class SpeciesParser {
                 if (sz.fixed || sz.choices || /size|medium|small|tiny|large/i.test(desc)) explicitSizeFound = true;
 
                 traitRows.push({
-                    uploadId:     `${traitSrcId}:${sp.name}:${traitName}`,
+                    uploadId:       `${traitSrcId}:${sp.name}:${traitName}`,
+                    speciesUploadId: uploadId,
                     speciesName:  sp.name,
                     name:         traitName,
                     description:  desc,
@@ -67,7 +68,8 @@ export class SpeciesParser {
             if (!explicitSpeedFound || !explicitSizeFound) {
                 const ws = sp.weightSpeeds.normal;
                 traitRows.push({
-                    uploadId:     `${sourceId}:${sp.name}:Base Physiology`,
+                    uploadId:       `${sourceId}:${sp.name}:Base Physiology`,
+                    speciesUploadId: uploadId,
                     speciesName:  sp.name,
                     name:         'Base Physiology',
                     description:  'Inherent physical characteristics.',
