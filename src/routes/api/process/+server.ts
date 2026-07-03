@@ -105,6 +105,10 @@ function cleanText(html: string | null | undefined): string {
         .replace(/<(p|br|div|li|tr|td|th|h[1-6])[^>]*>/gi, ' ')
         .replace(/<[^>]+>/g, '')
         .replace(/[\u2018\u2019\u201a\u201b\u02bc]/g, "'")
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&nbsp;/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
 }
@@ -143,10 +147,10 @@ function mergeGrants(pyGrants: Grants): Grants {
     return g;
 }
 
-function toExcel(rows: Record<string, unknown>[]): Buffer {
+function toExcel(rows: Record<string, unknown>[], sheet: string): Buffer {
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'data');
+    XLSX.utils.book_append_sheet(wb, ws, sheet);
     return Buffer.from(XLSX.write(wb, { type: 'array', bookType: 'xlsx' }));
 }
 
@@ -179,11 +183,19 @@ async function processClasses(items: unknown[]) {
     const parsed = z.array(DdbClassSchema).parse(items);
     const deduped = dedupBySource(parsed, c => ({ name: c.name, sourceId: c.sources?.[0]?.sourceId ?? 0 }));
 
-    // Collect all feature descriptions for Python grant extraction
+    // Collect feature descriptions for Python grant extraction
     const descs: {id: number; text: string}[] = [];
     let descId = 0;
-    const featDescIds: {clsIdx: number; featIdx: number; descId: number}[] = [];
 
+    // Class-level descriptions (for grantsSavingThrows on class row)
+    const clsDescIds: number[] = [];
+    for (let ci = 0; ci < deduped.length; ci++) {
+        clsDescIds.push(descId);
+        descs.push({ id: descId++, text: cleanText(deduped[ci].description) });
+    }
+
+    // Feature descriptions
+    const featDescIds: {clsIdx: number; featIdx: number; descId: number}[] = [];
     for (let ci = 0; ci < deduped.length; ci++) {
         for (let fi = 0; fi < deduped[ci].classFeatures.length; fi++) {
             descs.push({ id: descId, text: cleanText(deduped[ci].classFeatures[fi].description) });
@@ -198,20 +210,11 @@ async function processClasses(items: unknown[]) {
     const spellSlotRows: Record<string, unknown>[] = [];
     const spellsKnownRows: Record<string, unknown>[] = [];
 
-    // Build proficiency data per class from their proficiencies feature
-    const clsProfGrants = new Map<number, Grants>();
-    for (const { clsIdx, featIdx, descId: dId } of featDescIds) {
-        const f = deduped[clsIdx].classFeatures[featIdx];
-        if (f.name === 'Proficiencies' || (f.name ?? '').toLowerCase().startsWith('core ')) {
-            clsProfGrants.set(clsIdx, mergeGrants(grants.get(dId) ?? {}));
-        }
-    }
-
     for (let ci = 0; ci < deduped.length; ci++) {
         const cls = deduped[ci];
         const sourceId = cls.sources?.[0]?.sourceId ?? 0;
         const uploadId = `${sourceId}:${cls.name}`;
-        const prof = clsProfGrants.get(ci) ?? emptyGrants();
+        const clsGrants = mergeGrants(grants.get(clsDescIds[ci]) ?? {});
 
         // Subclass available level
         const subFeat = cls.classFeatures
@@ -230,9 +233,9 @@ async function processClasses(items: unknown[]) {
             source: srcName(sourceId),
             link: cls.moreDetailsUrl ? `https://www.dndbeyond.com${cls.moreDetailsUrl}` : '',
             sortOrder: ci + 1,
-            skillChoiceCount: prof.skillChoiceCount || '',
-            grantsSavingThrows: prof.grantsSavingThrows || '',
-            skillPool: prof.skillChoicePool || '',
+            skillChoiceCount: clsGrants.skillChoiceCount || '',
+            grantsSavingThrows: clsGrants.grantsSavingThrows || '',
+            skillPool: clsGrants.skillChoicePool || '',
         });
     }
 
@@ -291,10 +294,10 @@ async function processClasses(items: unknown[]) {
     }
 
     return {
-        'classes.xlsx':       toExcel(classRows),
-        'classFeatures.xlsx': toExcel(featureRows),
-        'spellSlots.xlsx':    toExcel(spellSlotRows),
-        'spellsKnown.xlsx':   toExcel(spellsKnownRows),
+        'classes.xlsx':       toExcel(classRows,       'classes'),
+        'classFeatures.xlsx': toExcel(featureRows,     'classFeatures'),
+        'spellSlots.xlsx':    toExcel(spellSlotRows,   'spellSlots'),
+        'spellsKnown.xlsx':   toExcel(spellsKnownRows, 'spellsKnown'),
     };
 }
 
@@ -377,12 +380,49 @@ async function processSubclasses(items: unknown[], classMap: Map<number, {name: 
     }
 
     return {
-        'subclasses.xlsx':       toExcel(subclassRows),
-        'subclassFeatures.xlsx': toExcel(featureRows),
+        'subclasses.xlsx':       toExcel(subclassRows, 'subclasses'),
+        'subclassFeatures.xlsx': toExcel(featureRows,  'subclassFeatures'),
     };
 }
 
 // ── Species processor ─────────────────────────────────────────────────────────
+
+function extractSenses(text: string): string {
+    const found: string[] = [];
+    for (const re of [
+        /Darkvision\s+(\d+)\s*(?:ft|feet)/i,
+        /Blindsight\s+(\d+)\s*(?:ft|feet)/i,
+        /Tremorsense\s+(\d+)\s*(?:ft|feet)/i,
+        /Truesight\s+(\d+)\s*(?:ft|feet)/i,
+    ]) {
+        const m = text.match(re);
+        if (m) found.push(m[0].replace(/feet/i, 'ft').replace(/\.\s*$/, '').trim());
+    }
+    return found.join(', ');
+}
+
+function extractSpeed(text: string): Record<string, number | undefined> {
+    const sp: Record<string, number | undefined> = {};
+    const pats: [string, RegExp][] = [
+        ['WALK', /(?:walking|base)\s+speed\s+(?:is|of)\s+(\d+)/i],
+        ['WALK', /[Yy]our speed is (\d+)/],
+        ['FLY',  /fly(?:ing)?\s+speed\s+(?:is|of)\s+(\d+)/i],
+        ['SWIM', /swim(?:ming)?\s+speed\s+(?:is|of)\s+(\d+)/i],
+        ['CLIMB',/climb(?:ing)?\s+speed\s+(?:is|of)\s+(\d+)/i],
+        ['BURROW',/burrow(?:ing)?\s+speed\s+(?:is|of)\s+(\d+)/i],
+    ];
+    for (const [key, re] of pats) {
+        if (!sp[key]) { const m = text.match(re); if (m) sp[key] = parseInt(m[1]); }
+    }
+    return sp;
+}
+
+function extractSize(text: string): { fixed: string; choices: string } {
+    const cM = text.match(/(Small|Medium|Large|Tiny|Huge|Gargantuan)\s+or\s+(Small|Medium|Large|Tiny|Huge|Gargantuan)/i);
+    if (cM) return { fixed: '', choices: `${cM[1]},${cM[2]}` };
+    const fM = text.match(/(?:size\s+is|you\s+are|Size:)\s*(Tiny|Small|Medium|Large|Huge|Gargantuan)/i);
+    return fM ? { fixed: fM[1], choices: '' } : { fixed: '', choices: '' };
+}
 
 async function processSpecies(items: unknown[]) {
     const parsed = z.array(DdbSpeciesSchema).parse(items);
@@ -390,7 +430,7 @@ async function processSpecies(items: unknown[]) {
     const deduped = dedupBySource(withName, s => ({ name: s.name, sourceId: s.sources?.[0]?.sourceId ?? 0 }));
 
     const descs: {id: number; text: string}[] = [];
-    type TMeta = { spName: string; traitName: string; level: number; srcId: number; speciesUploadId: string; walk: number; fly: number; swim: number; climb: number; burrow: number; sizeId: number };
+    type TMeta = { spName: string; traitName: string; level: number; srcId: number; speciesUploadId: string; sizeId: number };
     const traitMeta: TMeta[] = [];
     let descId = 0;
 
@@ -400,15 +440,11 @@ async function processSpecies(items: unknown[]) {
         for (const t of sp.racialTraits) {
             const def = t.definition;
             descs.push({ id: descId, text: cleanText(def?.description ?? t.description ?? '') });
-            const ws = sp.weightSpeeds?.normal;
             traitMeta.push({
                 spName: sp.name, traitName: def?.name ?? t.name ?? '',
                 level: def?.requiredLevel ?? t.requiredLevel ?? 1,
                 srcId: def?.sources?.[0]?.sourceId ?? sourceId,
-                speciesUploadId,
-                walk: ws?.walk ?? 0, fly: ws?.fly ?? 0, swim: ws?.swim ?? 0,
-                climb: ws?.climb ?? 0, burrow: ws?.burrow ?? 0,
-                sizeId: sp.sizeId,
+                speciesUploadId, sizeId: sp.sizeId,
             });
             descId++;
         }
@@ -429,24 +465,96 @@ async function processSpecies(items: unknown[]) {
         };
     });
 
-    const traitRows: Record<string, unknown>[] = traitMeta.map((m, i) => {
+    // Per-species: track whether any trait explicitly provides speed/size
+    // so we know whether to add a Base Physiology fallback row
+    const traitRows: Record<string, unknown>[] = [];
+    let currentSpName = '';
+    let explicitSpeed = false;
+    let explicitSize  = false;
+
+    for (let i = 0; i < traitMeta.length; i++) {
+        const m = traitMeta[i];
+        const desc = descs[i]?.text ?? '';
         const g = mergeGrants(grants.get(i) ?? {});
-        return {
+        const speeds = extractSpeed(desc);
+        const sz = extractSize(desc);
+        const senses = extractSenses(desc);
+
+        // Detect species boundary
+        if (m.spName !== currentSpName) {
+            // Flush Base Physiology for previous species if needed
+            if (currentSpName !== '') {
+                const prevSp = deduped.find(s => s.name === currentSpName)!;
+                const prevSrcId = prevSp.sources?.[0]?.sourceId ?? 0;
+                if (!explicitSpeed || !explicitSize) {
+                    const ws = prevSp.weightSpeeds?.normal;
+                    traitRows.push({
+                        uploadId: `${prevSrcId}:${currentSpName}:Base Physiology`,
+                        speciesUploadId: `${prevSrcId}:${currentSpName}`,
+                        speciesName: currentSpName,
+                        name: 'Base Physiology',
+                        requiredLevel: 1,
+                        description: 'Inherent physical characteristics.',
+                        size: explicitSize ? '' : (SIZE_MAP[prevSp.sizeId] ?? ''),
+                        sizeChoices: '', senses: '',
+                        WALK:   explicitSpeed ? '' : (ws?.walk   || ''),
+                        FLY:    ws?.fly    || '',
+                        SWIM:   ws?.swim   || '',
+                        CLIMB:  ws?.climb  || '',
+                        BURROW: ws?.burrow || '',
+                        ...emptyGrants(),
+                    });
+                }
+            }
+            currentSpName = m.spName;
+            explicitSpeed = false;
+            explicitSize  = false;
+            }
+
+        if (speeds['WALK']) explicitSpeed = true;
+        if (sz.fixed || sz.choices || /size|medium|small|tiny|large/i.test(desc)) explicitSize = true;
+
+        traitRows.push({
             uploadId: `${m.srcId}:${m.spName}:${m.traitName}`,
             speciesUploadId: m.speciesUploadId,
             speciesName: m.spName,
             name: m.traitName, requiredLevel: m.level,
-            description: descs[i]?.text ?? '',
-            size: SIZE_MAP[m.sizeId] ?? '',
-            sizeChoices: '',
-            senses: '',
-            WALK: m.walk || '', FLY: m.fly || '', SWIM: m.swim || '',
-            CLIMB: m.climb || '', BURROW: m.burrow || '',
+            description: desc,
+            size: sz.fixed, sizeChoices: sz.choices,
+            senses,
+            WALK: speeds['WALK'] ?? '', FLY: speeds['FLY'] ?? '',
+            SWIM: speeds['SWIM'] ?? '', CLIMB: speeds['CLIMB'] ?? '',
+            BURROW: speeds['BURROW'] ?? '',
             ...g,
-        };
-    });
+        });
+    }
 
-    return { 'species.xlsx': toExcel(speciesRows), 'speciesTraits.xlsx': toExcel(traitRows) };
+    // Flush last species
+    if (currentSpName) {
+        const lastSp = deduped.find(s => s.name === currentSpName)!;
+        const lastSrcId = lastSp.sources?.[0]?.sourceId ?? 0;
+        if (!explicitSpeed || !explicitSize) {
+            const ws = lastSp.weightSpeeds?.normal;
+            traitRows.push({
+                uploadId: `${lastSrcId}:${currentSpName}:Base Physiology`,
+                speciesUploadId: `${lastSrcId}:${currentSpName}`,
+                speciesName: currentSpName,
+                name: 'Base Physiology',
+                requiredLevel: 1,
+                description: 'Inherent physical characteristics.',
+                size: explicitSize ? '' : (SIZE_MAP[lastSp.sizeId] ?? ''),
+                sizeChoices: '', senses: '',
+                WALK:   explicitSpeed ? '' : (ws?.walk   || ''),
+                FLY:    ws?.fly    || '',
+                SWIM:   ws?.swim   || '',
+                CLIMB:  ws?.climb  || '',
+                BURROW: ws?.burrow || '',
+                ...emptyGrants(),
+            });
+        }
+    }
+
+    return { 'species.xlsx': toExcel(speciesRows, 'species'), 'speciesTraits.xlsx': toExcel(traitRows, 'speciesTraits') };
 }
 
 // ── Background processor ──────────────────────────────────────────────────────
@@ -475,7 +583,7 @@ async function processBackgrounds(items: unknown[]) {
         };
     });
 
-    return { 'backgrounds.xlsx': toExcel(rows) };
+    return { 'backgrounds.xlsx': toExcel(rows, 'backgrounds') };
 }
 
 // ── Feat processor ────────────────────────────────────────────────────────────
@@ -510,10 +618,19 @@ async function processFeats(items: unknown[]) {
         };
     });
 
-    return { 'feats.xlsx': toExcel(rows) };
+    return { 'feats.xlsx': toExcel(rows, 'feats') };
 }
 
 // ── Spell processor ───────────────────────────────────────────────────────────
+
+type SpellModifier = { type?: string; subType?: string; die?: { diceString?: string }; atHigherLevels?: { higherLevelDefinitions?: { level: number; dice?: { diceString?: string } }[] } };
+
+function buildDamageString(diceStr: string | undefined, subType: string | undefined): string {
+    if (!diceStr) return '';
+    const skip = ['additional', 'all', 'melee-weapon-attacks'];
+    const type = subType && !skip.includes(subType) ? subType.charAt(0).toUpperCase() + subType.slice(1) : '';
+    return type ? `${diceStr} ${type}` : diceStr;
+}
 
 async function processSpells(items: unknown[]) {
     const parsed = z.array(DdbSpellSchema).parse(items);
@@ -525,6 +642,29 @@ async function processSpells(items: unknown[]) {
             ? `${act.activationTime} ${ACT_MAP[act.activationType as number] ?? act.activationType}`
             : '';
         const slug = s.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '');
+
+        const dmgMods = ((s.modifiers ?? []) as SpellModifier[]).filter(m => m.type === 'damage' && m.die?.diceString);
+        const firstDmg = dmgMods[0];
+        const baseDie = firstDmg?.die?.diceString;
+        const subType = firstDmg?.subType;
+        const modHL = firstDmg?.atHigherLevels?.higherLevelDefinitions ?? [];
+
+        let cantripDmg = '', c5 = '', c11 = '', c17 = '';
+        let spellDmg = '', upcastPerSlot = '', upcastEvery2 = '';
+
+        if (s.level === 0) {
+            cantripDmg = buildDamageString(baseDie, subType);
+            c5  = buildDamageString(modHL.find(h => h.level === 5)?.dice?.diceString, subType);
+            c11 = buildDamageString(modHL.find(h => h.level === 11)?.dice?.diceString, subType);
+            c17 = buildDamageString(modHL.find(h => h.level === 17)?.dice?.diceString, subType);
+        } else {
+            spellDmg = buildDamageString(baseDie, subType);
+            const up1 = modHL.find(h => h.level === 1);
+            if (up1?.dice?.diceString) upcastPerSlot = buildDamageString(up1.dice.diceString, subType);
+            const up2 = modHL.find(h => h.level === 2);
+            if (up2?.dice?.diceString) upcastEvery2 = buildDamageString(up2.dice.diceString, subType);
+        }
+
         return {
             'Spell ID': s.id, 'Name': s.name,
             'Link': `https://www.dndbeyond.com/spells/${s.id}-${slug}`,
@@ -534,8 +674,8 @@ async function processSpells(items: unknown[]) {
             'Ritual': s.ritual ? 'true' : 'false',
             'Is Homebrew': s.isHomebrew ? 'true' : 'false',
             'Is Legacy': s.isLegacy ? 'true' : 'false',
-            'Cantrip Damage': '', 'Cantrip Dmg Lvl 5': '', 'Cantrip Dmg Lvl 11': '', 'Cantrip Dmg Lvl 17': '',
-            'Spell Damage': '', 'Upcast Per Slot': '', 'Upcast Every 2 Slots': '',
+            'Cantrip Damage': cantripDmg, 'Cantrip Dmg Lvl 5': c5, 'Cantrip Dmg Lvl 11': c11, 'Cantrip Dmg Lvl 17': c17,
+            'Spell Damage': spellDmg, 'Upcast Per Slot': upcastPerSlot, 'Upcast Every 2 Slots': upcastEvery2,
             'Spell Progression': '', 'Progression Note': '',
             'Range Origin': s.range?.origin ?? '',
             'Range Value (ft)': s.range?.rangeValue ?? '',
@@ -557,7 +697,7 @@ async function processSpells(items: unknown[]) {
         };
     });
 
-    return { 'spells.xlsx': toExcel(rows) };
+    return { 'spells.xlsx': toExcel(rows, 'spells') };
 }
 
 // ── Request handler ───────────────────────────────────────────────────────────

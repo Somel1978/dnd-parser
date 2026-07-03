@@ -76,7 +76,7 @@ def find_stats(s):   return [st for st in STATS if st.lower() in s.lower()]
 def extract(raw):
     text = clean(raw)
     tl = text.lower()
-    if not any(k in tl for k in ('proficien','expertise','language','choose','learn')):
+    if not any(k in tl for k in ('proficien','expertise','language','choose','learn','saving throw','saves:','cast','innate','darkvision','blindsight','tremorsense','truesight','speed','resistance','immune','vulnerab','speak','write')):
         return {}
 
     doc = nlp(text)
@@ -84,7 +84,7 @@ def extract(raw):
 
     # ── SKILLS ────────────────────────────────────────────────────────────────
     # 1. Labeled section
-    sec = section_after(text, r'Skills?\s+Proficiencies?[:\t]')
+    sec = section_after(text, r'Skills?(?:\s+Proficiencies?)?\s*[:\t]')
     if sec:
         n_m = re.search(r'Choose\s+(?:any\s+)?(\w+)', sec, re.I)
         n = WORD_NUMS.get(n_m.group(1).lower(),0) if n_m else 0
@@ -158,13 +158,14 @@ def extract(raw):
         # Gate ALL saving throw patterns on a fast keyword check first —
         # the inline pattern has nested quantifiers that backtrack catastrophically
         # on long texts that contain "proficiency in" but no "saving throws".
-        if 'saving throw' in tl:
+        if 'saving throw' in tl or 'saves:' in tl:
             if re.search(r'proficien\w*\s+in\s+all\s+saving\s+throws?', tl):
                 r['grantsSavingThrows'] = ','.join(STATS)
             else:
                 for pat in [
                     r'Saving\s+Throw\s+Proficiencies?[:\t]\s*(.{0,200})',
                     r'Saving\s+Throws?[:\t]\s*(.{0,200})',
+                    r'Saves?[:\t]\s*([A-Za-z,&\s]{3,60}?)(?:\s*<|\s*$|\n)',
                     r'Saving\s+Throw\s+Proficiencies\s+([A-Z][a-z]+(?:\s+and\s+[A-Z][a-z]+)*)',
                     # Simple bounded class — no nested quantifiers
                     r'proficien\w*\s+in\s+([A-Za-z,\s]{3,60})\s+saving\s+throws?',
@@ -246,8 +247,197 @@ def extract(raw):
                 span = win(doc, s, e)
                 if has_prof(span) or has_gain(span):
                     name = LANG_CANON.get(doc[s:e].text.lower(), doc[s:e].text)
+                    # Exclude 'Draconic ancestry' and similar non-language uses
+                    after_tok = doc[e].text.lower() if e < len(doc) else ''
+                    if after_tok in ('ancestry', 'ancestor', 'heritage'): continue
                     if not has_choice(span): grants.append(name)
             if grants: r['grantsLanguages'] = ','.join(dict.fromkeys(grants))
+
+    # ── INNATE SPELLS ─────────────────────────────────────────────────────────
+    # Format: SpellName:minCharLevel:usesPerDay[:true]
+    if 'cast' in tl or 'innate' in tl:
+        innate_re = re.compile(
+            r'(?:cast|use)\s+(?:the\s+|a\s+|an\s+)?'
+            r'([A-Za-z][a-zA-Z\' -]+?)'
+            r'(?:\s+(?:spell|cantrip|ability))?(?:\s+as\s+a\s+\d+(?:st|nd|rd|th)-level\s+spell)?(?:\s+\([^)]+\))?'
+            r'\s+(?:at[\s-]will|(?:once|twice|\d+\s+times?)(?:\s+with\s+this\s+trait)?\s+(?:per\s+(?:day|long\s+rest|short\s+rest)|with\s+this\s+trait))', re.I
+        )
+        lv_re = re.compile(r'(?:starting\s+at|once\s+you\s+reach|when\s+you\s+reach|you\s+reach|at)\s+(\d+)(?:st|nd|rd|th)?\s*level', re.I)
+        entries = []
+        for m in innate_re.finditer(text):
+            name = m.group(1).strip()
+            if not name or len(name) < 2: continue
+            name = ' '.join(w.capitalize() for w in name.split())
+            before = text[max(0, m.start()-200):m.start()]
+            lv_m = list(lv_re.finditer(before))[-1] if list(lv_re.finditer(before)) else None
+            min_level = int(lv_m.group(1)) if lv_m else 1
+            full = m.group(0).lower()
+            if 'at will' in full or 'at-will' in full:
+                uses = 0
+            elif 'twice' in full:
+                uses = 2
+            else:
+                nm = re.search(r'(\d+)\s+times?', full)
+                uses = int(nm.group(1)) if nm else 1
+            after = text[m.end():m.end()+200]
+            can_slot = bool(re.search(r'using\s+(?:a\s+)?spell\s+slot|expend\s+(?:a\s+)?spell\s+slot', after, re.I))
+            entry = f'{name}:{min_level}:{uses}'
+            if can_slot: entry += ':true'
+            entries.append(entry)
+        # Also catch "you know the X cantrip" = at will
+        know_re = re.compile(r'[Yy]ou\s+know\s+(?:the\s+)?([A-Za-z][a-zA-Z\' -]+?)\s+cantrip', re.I)
+        for m in know_re.finditer(text):
+            name = ' '.join(w.capitalize() for w in m.group(1).strip().split())
+            if name and len(name) >= 2:
+                entry = f'{name}:1:0'
+                if entry not in entries: entries.append(entry)
+
+        # Also catch "cast X with this trait ... long rest" (no explicit count = once)
+        with_trait_re = re.compile(
+            r'(?:cast|use)\s+(?:the\s+|also\s+)?([A-Za-z][a-zA-Z\'/\-\s]{2,40}?)\s+(?:as\s+a\s+\d+(?:st|nd|rd|th)-level\s+spell\s+)?(?:spell\s+)?with\s+(?:this\s+trait|it)'
+            r'(?![^.]*(?:once|twice|\d+\s+times?))', re.I
+        )
+        for m in with_trait_re.finditer(text):
+            name = ' '.join(w.capitalize() for w in m.group(1).strip().split())
+            if not name or len(name) < 3 or name.lower() in ('a','the','it','that','either','both','a spell','the spell','any spell'): continue
+            # Skip if this clause already has an explicit frequency (handled by main innate_re)
+            clause_end = text.find('.', m.start())
+            clause = text[m.start():clause_end] if clause_end > 0 else text[m.start():]
+            if re.search(r'\b(?:once|twice|\d+\s+times?)\b', clause, re.I): continue
+            # Skip 'or X' multi-spell cleanup phrases
+            if re.search(r'\bor\b', m.group(1)): continue
+            before = text[max(0, m.start()-200):m.start()]
+            lv_matches = list(lv_re.finditer(before))
+            lv_m = lv_matches[-1] if lv_matches else None
+            min_level = int(lv_m.group(1)) if lv_m else 1
+            entry = f'{name}:{min_level}:1'
+            if entry not in entries: entries.append(entry)
+
+        if entries:
+            r['grantsInnateSpells'] = ','.join(dict.fromkeys(entries))
+
+    # ── SENSES ────────────────────────────────────────────────────────────────
+    if 'grantsSenses' not in r:
+        senses = []
+        for sense, pats in [
+            ('Darkvision',  [
+                # Grant context: gain/have darkvision
+                r'(?:gain|grants?|gives?)\s+(?:you\s+)?(?:a\s+)?Darkvision\s+(?:with\s+a\s+range\s+of\s+)?(\d+)\s*(?:ft|feet)',
+                # Range increase
+                r'Darkvision\s+(?:range\s+)?(?:increase[sd]?\s+(?:by|to)|expands?\s+to)\s+(\d+)\s*(?:ft|feet)',
+                r'(?:your\s+)?darkvision\s+(?:bonus\s+)?(?:increase[sd]?\s+(?:by|to)|expands?\s+to)\s+(\d+)\s*(?:ft|feet)',
+            ]),
+            ('Blindsight',  [
+                r'(?:gain|grants?|gives?)\s+(?:you\s+)?(?:a\s+)?Blindsight\s+(?:with\s+a\s+range\s+of\s+)?(\d+)\s*(?:ft|feet)',
+                r'Blindsight\s+(?:range\s+)?(?:increase[sd]?\s+(?:by|to))\s+(\d+)\s*(?:ft|feet)',
+            ]),
+            ('Tremorsense', [
+                r'(?:gain|grants?|gives?)\s+(?:you\s+)?(?:a\s+)?Tremorsense\s+(?:with\s+a\s+range\s+of\s+)?(\d+)\s*(?:ft|feet)',
+                r'Tremorsense\s+(?:range\s+)?(?:increase[sd]?\s+(?:by|to))\s+(\d+)\s*(?:ft|feet)',
+            ]),
+            ('Truesight',   [
+                r'(?:gain|grants?|gives?)\s+(?:you\s+)?(?:a\s+)?Truesight\s+(?:with\s+a\s+range\s+of\s+)?(\d+)\s*(?:ft|feet)',
+                r'Truesight\s+(?:range\s+)?(?:increase[sd]?\s+(?:by|to))\s+(\d+)\s*(?:ft|feet)',
+            ]),
+        ]:
+            for pat in pats:
+                m = re.search(pat, text, re.I)
+                if m:
+                    senses.append(f'{sense} {m.group(1)} ft')
+                    break
+        if senses:
+            r['grantsSenses'] = ', '.join(senses)
+
+    # ── RESISTANCES / IMMUNITIES / VULNERABILITIES ─────────────────────────────
+    DMG_TYPES = ['acid','bludgeoning','cold','fire','force','lightning','necrotic',
+                 'piercing','poison','psychic','radiant','slashing','thunder']
+    DMG_SET = set(DMG_TYPES)
+    CONDITION_IMMUNITIES = ['disease','poisoned','frightened','charmed','exhaustion',
+                            'paralyzed','petrified','prone','restrained','stunned',
+                            'unconscious','blinded','deafened','aging']
+
+    def extract_dmg_types(chunk):
+        if re.search(r'\\ball\\b', chunk, re.I): return [t.capitalize() for t in DMG_TYPES]
+        if re.search(r'associated with|determined by|your choice', chunk, re.I): return []
+        found = []
+        for word in re.split(r'[,\s]+|\band\b|\bor\b', chunk):
+            w = word.replace('damage','').strip().lower()
+            if w in DMG_SET and w.capitalize() not in found:
+                found.append(w.capitalize())
+        return found
+
+    def find_dmg(patterns):
+        found = []
+        for pat in patterns:
+            for m in re.finditer(pat, text, re.I):
+                for t in extract_dmg_types(m.group(1)):
+                    if t not in found: found.append(t)
+        return ','.join(found)
+
+    if 'grantsResistances' not in r:
+        v = find_dmg([
+            r'[Rr]esistance\s+(?:to|against)\s+([\w\s,]+?\s+damage(?:\s+and\s+[\w\s,]+?\s+damage)*)',
+            r'[Rr]esistance\s+(?:to|against)\s+([\w,\s]+?)(?:\s+damage)',
+            r'gain\s+resistance\s+to\s+([\w\s,]+?\s+damage)',
+        ])
+        if v: r['grantsResistances'] = v
+
+    if 'grantsImmunities' not in r:
+        dmg_v = find_dmg([
+            r'[Ii]mmunit(?:y|ies)\s+to\s+([\w\s,]+?\s+damage(?:\s+and\s+[\w\s,]+?\s+damage)*)',
+            r'[Ii]mmun(?:e|ity)\s+to\s+([\w,\s]+?)(?:\s+damage)',
+        ])
+        cond_found = []
+        for m in re.finditer(r'immun(?:e|ity)\s+to\s+([^.;,]{3,50}?)(?=\s*[,;.]|\s+and\s+you|\s+you\s+have|$)', text, re.I):
+            chunk = m.group(1).lower()
+            for cond in CONDITION_IMMUNITIES:
+                if cond in chunk and cond.capitalize() not in cond_found:
+                    cond_found.append(cond.capitalize())
+        all_v = ','.join(x for x in [dmg_v] + cond_found if x)
+        if all_v: r['grantsImmunities'] = all_v
+
+    if 'grantsVulnerabilities' not in r:
+        v = find_dmg([
+            r'[Vv]ulnerab(?:le|ility)\s+to\s+([\w\s,]+?\s+damage(?:\s+and\s+[\w\s,]+?\s+damage)*)',
+            r'[Vv]ulnerab(?:le|ility)\s+to\s+([\w,\s]+?)(?:\s+damage)',
+        ])
+        if v: r['grantsVulnerabilities'] = v
+
+    # ── SPEED (grantsSpeed — additive bonuses in TYPE:amount format) ──────
+    if 'grantsSpeed' not in r:
+        speeds = {}
+        for sp_type, pats in [
+            ('WALK', [
+                r'walk(?:ing)?\s+speed\s+(?:bonus\s+)?increase[sd]?\s+(?:by|to)\s+(\d+)',
+                r'base\s+speed\s+(?:bonus\s+)?increase[sd]?\s+(?:by|to)\s+(\d+)',
+                r'unarmored\s+(?:speed|movement)\s+(?:bonus\s+)?increase[sd]?\s+(?:by|to)\s+(\d+)',
+                r'your\s+speed\s+(?:bonus\s+)?increase[sd]?\s+(?:by|to)\s+(\d+)',
+                r'increase[sd]?\s+your\s+speed\s+(?:by|to)\s+(\d+)',
+            ]),
+            ('FLY',    [
+                r'fly(?:ing)?\s+speed\s+(?:bonus\s+)?increase[sd]?\s+(?:by|to)\s+(\d+)',
+                r'increase[sd]?\s+your\s+fly(?:ing)?\s+speed\s+(?:by|to)\s+(\d+)',
+            ]),
+            ('SWIM',   [
+                r'swim(?:ming)?\s+speed\s+(?:bonus\s+)?increase[sd]?\s+(?:by|to)\s+(\d+)',
+                r'increase[sd]?\s+your\s+swim(?:ming)?\s+speed\s+(?:by|to)\s+(\d+)',
+            ]),
+            ('CLIMB',  [
+                r'climb(?:ing)?\s+speed\s+(?:bonus\s+)?increase[sd]?\s+(?:by|to)\s+(\d+)',
+                r'increase[sd]?\s+your\s+climb(?:ing)?\s+speed\s+(?:by|to)\s+(\d+)',
+            ]),
+            ('BURROW', [
+                r'burrow(?:ing)?\s+speed\s+(?:bonus\s+)?increase[sd]?\s+(?:by|to)\s+(\d+)',
+                r'increase[sd]?\s+your\s+burrow(?:ing)?\s+speed\s+(?:by|to)\s+(\d+)',
+            ]),
+        ]:
+            for pat in pats:
+                m = re.search(pat, text, re.I)
+                if m and sp_type not in speeds:
+                    speeds[sp_type] = m.group(1)
+                    break
+        if speeds:
+            r['grantsSpeed'] = ','.join(f'{k}:{v}' for k, v in speeds.items())
 
     return r
 
