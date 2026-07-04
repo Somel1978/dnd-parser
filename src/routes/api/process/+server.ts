@@ -4,6 +4,11 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import * as XLSX from 'xlsx';
 import { z } from 'zod';
+import { readFileSync } from 'fs';
+
+const SPELL_LISTS: Record<number, string> = JSON.parse(
+    readFileSync(new URL('../lib/data/spell-lists.json', import.meta.url), 'utf8')
+) as Record<number, string>;
 import { DdbClassSchema, DdbSubclassSchema, DdbSpeciesSchema,
          DdbBackgroundSchema, DdbFeatSchema, DdbSpellSchema } from '$lib/schemas/ddb';
 
@@ -269,6 +274,7 @@ function emptyGrants(): Grants {
         grantsLanguages:'', languageChoiceCount:'', languageChoicePool:'',
         grantsResistances:'', grantsImmunities:'', grantsVulnerabilities:'',
         grantsInnateSpells:'', grantsSpeed:'', grantsSenses:'',
+        grantsFeatId:'', grantsFeatCategory:'',
     };
 }
 
@@ -312,6 +318,18 @@ function getSpellArr(rules: Record<string, unknown>, key: string): (number | nul
 }
 
 // ── Class processor ───────────────────────────────────────────────────────────
+
+// Detect feat category granted by a feature based on description text
+function detectFeatCategory(desc: string): string {
+    const tl = desc.toLowerCase();
+    if (/fighting\s+style|style\s+of\s+fighting/i.test(tl) && /choose|adopt|select/i.test(tl)) return 'Fighting Style';
+    if (/epic\s+boon/i.test(tl)) return 'Epic Boon';
+    if (/origin\s+feat/i.test(tl)) return 'Origin';
+    if (/general\s+feat/i.test(tl)) return 'General';
+    if (/ability\s+score\s+improv/i.test(tl) || /ability\s+score\s+increas/i.test(tl)) return 'General';
+    if (/feat\s+of\s+your\s+choice|you\s+gain\s+a\s+feat|choose\s+a\s+feat/i.test(tl)) return 'General';
+    return '';
+}
 
 async function processClasses(items: unknown[]) {
     const parsed = z.array(DdbClassSchema).parse(items);
@@ -390,6 +408,7 @@ async function processClasses(items: unknown[]) {
             description: cleanText(f.description),
             url: f.moreDetailsUrl ? `https://www.dndbeyond.com${f.moreDetailsUrl}` : '',
             ...g,
+            grantsFeatCategory: detectFeatCategory(cleanText(f.description)),
         });
     }
 
@@ -510,6 +529,7 @@ async function processSubclasses(items: unknown[], classMap: Map<number, {name: 
             description: descs[i]?.text ?? '',
             url: '',
             ...g,
+            grantsFeatCategory: detectFeatCategory(descs[i]?.text ?? ''),
         });
     }
 
@@ -660,6 +680,7 @@ async function processSpecies(items: unknown[]) {
             SWIM: speeds['SWIM'] ?? '', CLIMB: speeds['CLIMB'] ?? '',
             BURROW: speeds['BURROW'] ?? '',
             ...g,
+            grantsFeatCategory: detectFeatCategory(desc),
         });
     }
 
@@ -1128,8 +1149,15 @@ function buildCantripLevelDamage(dmgMods: SpellModifier[], charLevel: number): s
 
 async function processSpells(items: unknown[]) {
     const parsed = z.array(DdbSpellSchema).parse(items);
+    // Deduplicate by definition.id — spells appear once per class spell list
+    const seen = new Set<number>();
+    const deduped = parsed.filter(w => {
+        if (seen.has(w.definition.id)) return false;
+        seen.add(w.definition.id);
+        return true;
+    });
 
-    const rows = parsed.map(w => {
+    const rows = deduped.map(w => {
         const s = w.definition;
         const act = s.activation;
 
@@ -1198,7 +1226,7 @@ async function processSpells(items: unknown[]) {
             'Description': cleanText(s.description),
             'Source Book': srcName(s.sources?.[0]?.sourceId),
             'Tags': (s.tags ?? []).join(', '),
-            'Spell List': '',
+            'Spell List': SPELL_LISTS[s.id] ?? '',
         };
     });
 
