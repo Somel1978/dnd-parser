@@ -68,17 +68,26 @@ export const DdbSpeciesSchema = z.object({
 
 // ── Backgrounds ───────────────────────────────────────────────────────────────
 
+const GrantedFeatSchema = z.object({
+    id: z.number(),
+    name: z.string(),
+    featIds: z.array(z.number()).default([]),
+});
+
 export const DdbBackgroundSchema = z.object({
     name: z.string(),
     description: z.string().nullable().default(''),
     shortDescription: z.string().nullable().default(''),
     cardDescription: z.string().nullable().default(''),
     featureName: z.string().nullable().default(''),
+    featureIsFeat: z.boolean().default(false),
     skillProficienciesDescription: z.string().nullable().default(''),
     toolProficienciesDescription: z.string().nullable().default(''),
     languagesDescription: z.string().nullable().default(''),
     moreDetailsUrl: z.string().nullable().default(''),
-    sources: z.array(SourceSchema).default([])
+    sources: z.array(SourceSchema).default([]),
+    grantedFeats: z.array(GrantedFeatSchema).nullable().default([]),
+    featList: GrantedFeatSchema.nullable().default(null),
 });
 
 // ── Feats ─────────────────────────────────────────────────────────────────────
@@ -101,6 +110,8 @@ export const DdbFeatSchema = z.object({
     description: z.string().nullable().default(''),
     snippet: z.string().nullable().default(''),
     isRepeatable: z.boolean().default(false),
+    isHomebrew: z.boolean().default(false),
+    repeatableParentId: z.number().nullable().default(null),
     categories: z.array(z.object({ tagName: z.string() })).default([]),
     prerequisites: z.array(PrerequisiteSchema).default([]),
     moreDetailsUrl: z.string().nullable().default(''),
@@ -125,24 +136,28 @@ export const DdbSpellSchema = z.object({
         components: z.array(z.number()).default([]),
         tags: z.array(z.string()).default([]),
         duration: z.object({
-            durationType: z.string().optional(),
-            durationInterval: z.number().optional(),
-            durationUnit: z.string().optional()
-        }).optional(),
+            durationType: z.string().nullable().optional(),
+            durationInterval: z.number().nullable().optional(),
+            durationUnit: z.string().nullable().optional()
+        }).nullable().optional(),
         activation: z.object({
-            activationTime: z.number().optional(),
-            activationType: z.number().optional()
-        }).optional(),
+            activationTime: z.number().nullable().optional(),
+            activationType: z.number().nullable().optional()
+        }).nullable().optional(),
         range: z.object({
-            origin: z.string().optional(),
-            rangeValue: z.number().optional(),
-            aoeType: z.string().optional(),
-            aoeValue: z.number().optional()
-        }).optional(),
+            origin: z.string().nullable().optional(),
+            rangeValue: z.number().nullable().optional(),
+            aoeType: z.string().nullable().optional(),
+            aoeValue: z.number().nullable().optional()
+        }).nullable().optional(),
         modifiers: z.array(z.any()).default([]),
         atHigherLevels: z.any().optional(),
         saveDcAbilityId: z.number().nullable().default(null),
         description: z.string().nullable().default(''),
+        snippet: z.string().nullable().default(''),
+        componentsDescription: z.string().nullable().default(''),
+        scaleType: z.string().nullable().optional(),
+        castingTimeDescription: z.string().nullable().optional(),
         sources: z.array(SourceSchema).default([])
     })
 });

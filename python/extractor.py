@@ -30,6 +30,28 @@ WORD_NUMS = {'another':1,'one':1,'a':1,'an':1,'two':2,'three':3,'four':4,
 
 SKILL_CANON = {s.lower():s for s in SKILLS}
 TOOL_CANON  = {t.lower():t for t in TOOLS}
+# Add common spelling variants
+TOOL_CANON.update({
+    "thieves tools": "Thieves' Tools",
+    "thieves' tools": "Thieves' Tools",
+    "artisan's tools": "Artisan's Tools",
+    "artisans' tools": "Artisan's Tools",
+    "artisan tools": "Artisan's Tools",
+    "gaming sets": "Gaming Set",
+    "musical instruments": "Musical Instrument",
+})
+ARTISAN_TOOLS_POOL = ','.join(ARTISAN_TOOLS)
+GAMING_SET_POOL = 'Dice Set,Dragonchess Set,Playing Card Set,Three-Dragon Ante Set'
+MUSICAL_INSTRUMENT_POOL = 'Bagpipes,Drum,Dulcimer,Flute,Lute,Lyre,Horn,Pan Flute,Shawm,Viol'
+TOOL_CATEGORY_POOL = {
+    "artisan's tools": ARTISAN_TOOLS_POOL,
+    "artisans' tools": ARTISAN_TOOLS_POOL,
+    "artisan tools": ARTISAN_TOOLS_POOL,
+    "gaming set": GAMING_SET_POOL,
+    "gaming sets": GAMING_SET_POOL,
+    "musical instrument": MUSICAL_INSTRUMENT_POOL,
+    "musical instruments": MUSICAL_INSTRUMENT_POOL,
+}
 LANG_CANON  = {l.lower():l for l in LANGUAGES}
 
 nlp = spacy.blank('en')
@@ -41,7 +63,10 @@ def make_matcher(items):
     return m
 
 skill_m = make_matcher(SKILLS)
-tool_m  = make_matcher(TOOLS)
+tool_m  = make_matcher(TOOLS + [
+    "Thieves Tools", "Artisan's Tools", "Artisans' Tools", "Artisan Tools",
+    "Gaming Sets", "Musical Instruments",
+])
 lang_m  = make_matcher(LANGUAGES)
 
 CURLY = str.maketrans('\u2018\u2019\u201a\u201b\u02bc', "'''''" )
@@ -123,14 +148,13 @@ def extract(raw):
             n = find_n(cm.group(0))
             if n:
                 after = text[cm.end():cm.end()+300]
-                list_m = re.search(
-                    r'(?:from(?:\s+(?:among|the\s+following))?|following\s+skills?)[^:]*:?\s*'
-                    r'([A-Za-z,\s]+?)(?:\.|;|$)', after, re.I)
                 pool = []
+                list_m = re.search(
+                    r'(?:from(?:\s+(?:among|the\s+following))?|following\s+skills?|the\s+following\s+list)[^:]*:?\s*'
+                    r'([A-Za-z ,]+?)(?:\.|;|$)', after, re.I)
                 if list_m:
-                    for part in re.split(r'[,\s]+(?:and\s+|or\s+)?', list_m.group(1)):
-                        k = part.strip().lower()
-                        if k in SKILL_CANON: pool.append(SKILL_CANON[k])
+                    chunk = list_m.group(1).lower()
+                    pool = [SKILL_CANON[s] for s in SKILL_CANON if s in chunk]
                 r['skillChoiceCount'] = n
                 r['skillChoicePool'] = ','.join(pool) or ','.join(SKILLS)
 
@@ -191,9 +215,9 @@ def extract(raw):
 
     if 'toolChoiceCount' not in r and 'grantsTools' not in r:
         tm = re.search(
-            r'proficien\w*\s+with\s+(one|two|three|four|\d+)\s+'
-            r'(?:(?:type(?:s)?\s+of|different)\s+)?'
-            r"(Artisan.{0,8}Tools?|Musical\s+Instruments?|Gaming\s+Sets?|tools?)"
+            r'(?:proficien\w*\s+with\s+)?(?:one|two|three|four|\d+)\s+'
+            r'(?:type(?:s)?\s+of\s+|different\s+)?'
+            r"(?:Artisan.{0,12}[Tt]ools?|Musical\s+Instruments?|Gaming\s+Sets?)"
             r'(?:\s+of\s+your\s+choice)?', text, re.I
         ) or re.search(
             r'(one|two|three|four|\d+)\s+tool\s+proficiencies?\s+of\s+your\s+choice', text, re.I
@@ -201,10 +225,20 @@ def extract(raw):
         if tm:
             n = find_n(tm.group(0))
             seg = tm.group(0).lower()
-            pool = 'Musical Instrument' if 'musical' in seg else \
-                   'Gaming Set' if 'gaming' in seg else \
-                   ','.join(ARTISAN_TOOLS) if 'artisan' in seg else ','.join(TOOLS)
+            pool = MUSICAL_INSTRUMENT_POOL if 'musical' in seg else \
+                   GAMING_SET_POOL if 'gaming' in seg else \
+                   ARTISAN_TOOLS_POOL if 'artisan' in seg else ','.join(TOOLS)
             r['toolChoiceCount'] = n; r['toolChoicePool'] = pool
+            # Also extract any specific tools mentioned alongside the category
+            extra_grants = []
+            for _, s, e in tool_m(doc):
+                span = win(doc, s, e)
+                name = TOOL_CANON.get(doc[s:e].text.lower(), doc[s:e].text)
+                # Only specific tools (not categories) not already in pool
+                if (has_prof(span) or has_gain(span)) and not has_choice(span):
+                    if name not in ('Gaming Set','Musical Instrument',"Artisan's Tools") and name not in pool:
+                        extra_grants.append(name)
+            if extra_grants: r['grantsTools'] = ','.join(dict.fromkeys(extra_grants))
 
     if 'toolChoiceCount' not in r and 'grantsTools' not in r:
         grants = []
@@ -234,10 +268,11 @@ def extract(raw):
 
     if 'languageChoiceCount' not in r and 'grantsLanguages' not in r:
         lm = re.search(
-            r'(?:learn|know|speak)\s+(one|two|three|\d+)\s+(?:additional\s+)?languages?\s+'
+            r'(?:learn|know|speak)\s+(one|two|three|\d+)\s+(?:additional|extra|other|more)?\s*languages?\s+'
             r'(?:of\s+your\s+choice|you\s+(?:roll|choose))', text, re.I
-        ) or re.search(r'(?:learn|know)\s+one\s+(?:additional\s+)?language\b', text, re.I) \
-          or re.search(r'one\s+language\s+of\s+your\s+choice', text, re.I)
+        ) or re.search(r'(?:learn|know|speak)\s+one\s+(?:additional|extra|other)?\s*language\b', text, re.I) \
+          or re.search(r'one\s+(?:additional|extra|other)?\s*language\s+of\s+your\s+choice', text, re.I) \
+          or re.search(r'(one|two|three|\d+)\s+(?:additional|extra|other|more)\s+languages?', text, re.I)
         if lm:
             r['languageChoiceCount'] = max(find_n(lm.group(0)), 1)
             r['languageChoicePool'] = ','.join(LANGUAGES)
@@ -257,7 +292,7 @@ def extract(raw):
     # Format: SpellName:minCharLevel:usesPerDay[:true]
     if 'cast' in tl or 'innate' in tl:
         innate_re = re.compile(
-            r'(?:cast|use)\s+(?:the\s+|a\s+|an\s+)?'
+            r'(?:cast)\s+(?:the\s+|a\s+|an\s+)?'
             r'([A-Za-z][a-zA-Z\' -]+?)'
             r'(?:\s+(?:spell|cantrip|ability))?(?:\s+as\s+a\s+\d+(?:st|nd|rd|th)-level\s+spell)?(?:\s+\([^)]+\))?'
             r'\s+(?:at[\s-]will|(?:once|twice|\d+\s+times?)(?:\s+with\s+this\s+trait)?\s+(?:per\s+(?:day|long\s+rest|short\s+rest)|with\s+this\s+trait))', re.I
@@ -265,9 +300,8 @@ def extract(raw):
         lv_re = re.compile(r'(?:starting\s+at|once\s+you\s+reach|when\s+you\s+reach|you\s+reach|at)\s+(\d+)(?:st|nd|rd|th)?\s*level', re.I)
         entries = []
         for m in innate_re.finditer(text):
-            name = m.group(1).strip()
-            if not name or len(name) < 2: continue
-            name = ' '.join(w.capitalize() for w in name.split())
+            raw_name = m.group(1).strip()
+            if not raw_name or len(raw_name) < 2: continue
             before = text[max(0, m.start()-200):m.start()]
             lv_m = list(lv_re.finditer(before))[-1] if list(lv_re.finditer(before)) else None
             min_level = int(lv_m.group(1)) if lv_m else 1
@@ -281,16 +315,26 @@ def extract(raw):
                 uses = int(nm.group(1)) if nm else 1
             after = text[m.end():m.end()+200]
             can_slot = bool(re.search(r'using\s+(?:a\s+)?spell\s+slot|expend\s+(?:a\s+)?spell\s+slot', after, re.I))
-            entry = f'{name}:{min_level}:{uses}'
-            if can_slot: entry += ':true'
-            entries.append(entry)
+            # Split on " and " to handle "detect magic and identify" as two spells
+            spell_parts = re.split(r'\s+and\s+', raw_name, flags=re.I)
+            for part in spell_parts:
+                name = ' '.join(w.capitalize() for w in part.strip().split())
+            for part in spell_parts:
+                part = re.sub(r'\s+(?:with\s+(?:this\s+trait|it)|using\s+this\s+trait).*$', '', part.strip(), flags=re.I).strip()
+                name = ' '.join(w.capitalize() for w in part.split())
+                entry = f'{name}:{min_level}:{uses}'
+                if can_slot: entry += ':true'
+                entries.append(entry)
         # Also catch "you know the X cantrip" = at will
-        know_re = re.compile(r'[Yy]ou\s+know\s+(?:the\s+)?([A-Za-z][a-zA-Z\' -]+?)\s+cantrip', re.I)
+        # Guard: skip if this is a class spellcasting feature (has spell slots/spell list context)
+        know_re = re.compile(r'[Yy]ou\s+know\s+the\s+([A-Za-z][a-zA-Z\' -]+?)\s+cantrip(?!s)', re.I)
+        _NUMBER_WORDS = {'one','two','three','four','five','six','seven','eight','nine','ten','a','an','additional','more','any'}
         for m in know_re.finditer(text):
             name = ' '.join(w.capitalize() for w in m.group(1).strip().split())
-            if name and len(name) >= 2:
-                entry = f'{name}:1:0'
-                if entry not in entries: entries.append(entry)
+            # Skip if name is a number word (e.g. 'you know two cantrips')
+            if not name or len(name) < 2 or m.group(1).strip().lower() in _NUMBER_WORDS: continue
+            entry = f'{name}:1:0'
+            if entry not in entries: entries.append(entry)
 
         # Also catch "cast X with this trait ... long rest" (no explicit count = once)
         with_trait_re = re.compile(
