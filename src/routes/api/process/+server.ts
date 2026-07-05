@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { readFileSync } from 'fs';
 
 const SPELL_LISTS: Record<number, string> = JSON.parse(
-    readFileSync(new URL('../lib/data/spell-lists.json', import.meta.url), 'utf8')
+    readFileSync(new URL('../../../lib/data/spell-lists.json', import.meta.url), 'utf8')
 ) as Record<number, string>;
 import { DdbClassSchema, DdbSubclassSchema, DdbSpeciesSchema,
          DdbBackgroundSchema, DdbFeatSchema, DdbSpellSchema } from '$lib/schemas/ddb';
@@ -273,6 +273,9 @@ function emptyGrants(): Grants {
         grantsTools:'', toolChoiceCount:'', toolChoicePool:'',
         grantsLanguages:'', languageChoiceCount:'', languageChoicePool:'',
         grantsResistances:'', grantsImmunities:'', grantsVulnerabilities:'',
+        resistanceChoiceCount:'', resistanceChoicePool:'',
+        immunityChoiceCount:'', immunityChoicePool:'',
+        vulnerabilityChoiceCount:'', vulnerabilityChoicePool:'',
         grantsInnateSpells:'', grantsSpeed:'', grantsSenses:'',
         grantsFeatId:'', grantsFeatCategory:'',
     };
@@ -1012,12 +1015,17 @@ async function processBackgrounds(items: unknown[]) {
     const parsed = z.array(DdbBackgroundSchema).parse(items);
     const deduped = dedupBySource(parsed, b => ({ name: b.name, sourceId: b.sources?.[0]?.sourceId ?? 0 }));
 
+    // Run description through extractor for resistance/immunity/innate/speed/senses grants
+    const descs = deduped.map((b, i) => ({ id: i, text: cleanText(b.description) }));
+    const grants = await runExtractor(descs);
+
     const rows = deduped.map((b, i) => {
         const sourceId = b.sources?.[0]?.sourceId ?? 0;
         const skillP = parseSkillProf(cleanText(b.skillProficienciesDescription));
         const toolP  = parseToolProf(cleanText(b.toolProficienciesDescription));
         const langP  = parseLangProf(cleanText(b.languagesDescription));
         const { grantsFeatId, grantsFeatCategory } = resolveFeatGrant(b.grantedFeats);
+        const g = mergeGrants(grants.get(i) ?? {});
 
         return {
             uploadId: `${sourceId}:${b.name}`,
@@ -1026,23 +1034,29 @@ async function processBackgrounds(items: unknown[]) {
             featureName: b.featureName ?? '',
             grantsFeatCategory,
             grantsFeatId,
-            grantsSkills:           skillP.grantsSkills,
-            skillChoiceCount:       skillP.skillChoiceCount || '',
-            skillChoicePool:        skillP.skillChoicePool,
-            savingThrowChoiceCount: '',
-            savingThrowChoicePool:  '',
-            grantsTools:            toolP.grantsTools,
-            toolChoiceCount:        toolP.toolChoiceCount || '',
-            toolChoicePool:         toolP.toolChoicePool,
-            grantsLanguages:        langP.grantsLanguages,
-            languageChoiceCount:    langP.languageChoiceCount || '',
-            languageChoicePool:     langP.languageChoicePool,
-            grantsResistances:      '',
-            grantsImmunities:       '',
-            grantsVulnerabilities:  '',
-            grantsInnateSpells:     '',
-            grantsSpeed:            '',
-            grantsSenses:           '',
+            grantsSkills:              skillP.grantsSkills,
+            skillChoiceCount:          skillP.skillChoiceCount || '',
+            skillChoicePool:           skillP.skillChoicePool,
+            savingThrowChoiceCount:    g.savingThrowChoiceCount || '',
+            savingThrowChoicePool:     g.savingThrowChoicePool || '',
+            grantsTools:               toolP.grantsTools,
+            toolChoiceCount:           toolP.toolChoiceCount || '',
+            toolChoicePool:            toolP.toolChoicePool,
+            grantsLanguages:           langP.grantsLanguages,
+            languageChoiceCount:       langP.languageChoiceCount || '',
+            languageChoicePool:        langP.languageChoicePool,
+            grantsResistances:         g.grantsResistances || '',
+            grantsImmunities:          g.grantsImmunities || '',
+            grantsVulnerabilities:     g.grantsVulnerabilities || '',
+            resistanceChoiceCount:     g.resistanceChoiceCount || '',
+            resistanceChoicePool:      g.resistanceChoicePool || '',
+            immunityChoiceCount:       g.immunityChoiceCount || '',
+            immunityChoicePool:        g.immunityChoicePool || '',
+            vulnerabilityChoiceCount:  g.vulnerabilityChoiceCount || '',
+            vulnerabilityChoicePool:   g.vulnerabilityChoicePool || '',
+            grantsInnateSpells:        g.grantsInnateSpells || '',
+            grantsSpeed:               g.grantsSpeed || '',
+            grantsSenses:              g.grantsSenses || '',
             url: b.moreDetailsUrl ? `https://www.dndbeyond.com${b.moreDetailsUrl}` : '',
             sortOrder: i + 1,
         };
@@ -1057,7 +1071,7 @@ const ABILITY_SCORES = ['Strength','Dexterity','Constitution','Intelligence','Wi
 
 function extractASI(text: string): { asiAmount: string; asiStatFixed: string; asiStatChoices: string } {
     // Match "Increase your/one/a X[, Y, or Z] [score] by N"
-    const m = text.match(/Increase\s+(?:your|one|a)\s+([A-Za-z, ]+?)\s+(?:score\s+)?by\s+(\d+)/i);
+    const m = text.match(/Increase\s+(?:your|one|a|the)\s+([A-Za-z, ]+?)\s+(?:score\s+)?by\s+(\d+)/i);
     if (!m) return { asiAmount: '', asiStatFixed: '', asiStatChoices: '' };
     const amount = m[2];
     const statPart = m[1].trim();

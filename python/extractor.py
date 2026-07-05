@@ -290,7 +290,7 @@ def extract(raw):
 
     # ── INNATE SPELLS ─────────────────────────────────────────────────────────
     # Format: SpellName:minCharLevel:usesPerDay[:true]
-    if 'cast' in tl or 'innate' in tl:
+    if 'cast' in tl or 'innate' in tl or 'you learn' in tl:
         innate_re = re.compile(
             r'(?:cast)\s+(?:the\s+|a\s+|an\s+)?'
             r'([A-Za-z][a-zA-Z\' -]+?)'
@@ -302,6 +302,7 @@ def extract(raw):
         for m in innate_re.finditer(text):
             raw_name = m.group(1).strip()
             if not raw_name or len(raw_name) < 2: continue
+            if not raw_name or len(raw_name) < 2 or raw_name.lower() in ('it','this','that','a','the','a spell','the spell'): continue
             before = text[max(0, m.start()-200):m.start()]
             lv_m = list(lv_re.finditer(before))[-1] if list(lv_re.finditer(before)) else None
             min_level = int(lv_m.group(1)) if lv_m else 1
@@ -325,6 +326,31 @@ def extract(raw):
                 entry = f'{name}:{min_level}:{uses}'
                 if can_slot: entry += ':true'
                 entries.append(entry)
+        # Also catch "you learn the X spell/cantrip" with subsequent casting constraint
+        can_slot = False
+        learn_re = re.compile(r'[Yy]ou\s+learn\s+(?:the\s+)?([A-Za-z][a-zA-Z\'\s,and-]+?)\s+(?:spells?|cantrips?)', re.I)
+        for lm in learn_re.finditer(text):
+            raw_group = lm.group(1).strip()
+            is_cantrip = 'cantrip' in lm.group(0).lower()
+            after = text[lm.end():lm.end()+400]
+            # Determine usage
+            if is_cantrip or re.search(r'at[\s-]will', after, re.I):
+                uses, can_slot = 0, False
+            elif re.search(r'without\s+expending\s+a\s+spell\s+slot', after, re.I):
+                uses, can_slot = 1, True
+            elif re.search(r'once.*?(?:long|short)\s+rest|once.*?per\s+day', after, re.I):
+                uses = 1
+                can_slot = bool(re.search(r'using\s+spell\s+slots?', after, re.I))
+            else:
+                continue
+            # Split on " and " to handle multiple spells
+            parts = re.split(r'\s+and\s+', raw_group, flags=re.I)
+            for part in parts:
+                spell_name = ' '.join(w.capitalize() for w in part.strip().split())
+                if not spell_name or len(spell_name) < 2: continue
+                entry = f'{spell_name}:1:{uses}'
+                if uses == 1 and can_slot: entry += ':true'
+                if entry not in entries: entries.append(entry)
         # Also catch "you know the X cantrip" = at will
         # Guard: skip if this is a class spellcasting feature (has spell slots/spell list context)
         know_re = re.compile(r'[Yy]ou\s+know\s+the\s+([A-Za-z][a-zA-Z\' -]+?)\s+cantrip(?!s)', re.I)
@@ -418,6 +444,38 @@ def extract(raw):
                     if t not in found: found.append(t)
         return ','.join(found)
 
+    # ── RESISTANCE / IMMUNITY / VULNERABILITY CHOICES ────────────────────────────
+    def find_dmg_choice(patterns):
+        for pat in patterns:
+            m = re.search(pat, text, re.I)
+            if m:
+                chunk = m.group(1)
+                types = extract_dmg_types(chunk)
+                if types: return types
+        return []
+
+    if 'resistanceChoiceCount' not in r:
+        # "resistance to N of the following damage types of your choice: X, Y, Z"
+        cnt_m = re.search(r'[Rr]esistance\s+to\s+(\w+)\s+(?:of\s+the\s+following\s+)?damage\s+types?\s+of\s+your\s+choice[:\s]+([^.;]+)', text, re.I)
+        if cnt_m:
+            _WN = {'one':1,'two':2,'three':3,'four':4,'five':5}
+            count = _WN.get(cnt_m.group(1).lower(), 1)
+            pool = extract_dmg_types(cnt_m.group(2))
+            if pool: r['resistanceChoiceCount'] = count; r['resistanceChoicePool'] = ','.join(pool)
+        else:
+            # "gives you resistance to a damage type" → choice from all types
+            gen_m = re.search(r'(?:gain|gives?\s+you|have)\s+[Rr]esistance\s+to\s+(?:a|one)\s+damage\s+type', text, re.I)
+            if gen_m:
+                r['resistanceChoiceCount'] = 1; r['resistanceChoicePool'] = ','.join([t.capitalize() for t in DMG_TYPES])
+            else:
+                # "choose Acid, Cold, Fire, or Poison. You have resistance"
+                choose_res = re.search(r'[Cc]hoose\s+(?:one\s+)?(?:of\s+)?(?:the\s+following\s+)?([A-Za-z,\s]+?)(?:\.|,|;)\s+[Yy]ou\s+(?:have|gain)\s+[Rr]esistance', text, re.I)
+                if not choose_res:
+                    choose_res = re.search(r'[Cc]hoose\s+(?:one\s+of\s+)?(?:the\s+following\s+)?(?:damage\s+types?:?\s+)?([A-Za-z,\s]+?)\.\s+[Yy]ou\s+have\s+[Rr]esistance', text, re.I)
+                if choose_res:
+                    pool = extract_dmg_types(choose_res.group(1))
+                    if pool: r['resistanceChoiceCount'] = 1; r['resistanceChoicePool'] = ','.join(pool)
+
     if 'grantsResistances' not in r:
         v = find_dmg([
             r'[Rr]esistance\s+(?:to|against)\s+([\w\s,]+?\s+damage(?:\s+and\s+[\w\s,]+?\s+damage)*)',
@@ -425,6 +483,14 @@ def extract(raw):
             r'gain\s+resistance\s+to\s+([\w\s,]+?\s+damage)',
         ])
         if v: r['grantsResistances'] = v
+
+    if 'immunityChoiceCount' not in r:
+        cnt_m = re.search(r'[Ii]mmunit(?:y|ies)\s+to\s+(\w+)\s+(?:of\s+the\s+following\s+)?damage\s+types?\s+of\s+your\s+choice[:\s]+([^.;]+)', text, re.I)
+        if cnt_m:
+            _WN = {'one':1,'two':2,'three':3,'four':4,'five':5}
+            count = _WN.get(cnt_m.group(1).lower(), 1)
+            pool = extract_dmg_types(cnt_m.group(2))
+            if pool: r['immunityChoiceCount'] = count; r['immunityChoicePool'] = ','.join(pool)
 
     if 'grantsImmunities' not in r:
         dmg_v = find_dmg([
@@ -439,6 +505,14 @@ def extract(raw):
                     cond_found.append(cond.capitalize())
         all_v = ','.join(x for x in [dmg_v] + cond_found if x)
         if all_v: r['grantsImmunities'] = all_v
+
+    if 'vulnerabilityChoiceCount' not in r:
+        cnt_m = re.search(r'[Vv]ulnerab(?:le|ility)\s+to\s+(\w+)\s+(?:of\s+the\s+following\s+)?damage\s+types?\s+of\s+your\s+choice[:\s]+([^.;]+)', text, re.I)
+        if cnt_m:
+            _WN = {'one':1,'two':2,'three':3,'four':4,'five':5}
+            count = _WN.get(cnt_m.group(1).lower(), 1)
+            pool = extract_dmg_types(cnt_m.group(2))
+            if pool: r['vulnerabilityChoiceCount'] = count; r['vulnerabilityChoicePool'] = ','.join(pool)
 
     if 'grantsVulnerabilities' not in r:
         v = find_dmg([
